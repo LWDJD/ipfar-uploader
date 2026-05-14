@@ -122,14 +122,35 @@ func TestComputePoW_SafetyLimit(t *testing.T) {
 }
 
 func TestComputePoWWithProgress_Cancellation(t *testing.T) {
+	rootCID := "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+	dataTXID := "cancel-test"
+
+	// Use an already-cancelled context — no timing dependency.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var lastAttempt uint64
+	_, err := FastComputePoWWithProgress(ctx, rootCID, dataTXID, func(attempts uint64) {
+		lastAttempt = attempts
+	})
+
+	if err != ErrPoWCancelled {
+		t.Errorf("expected ErrPoWCancelled, got %v (last attempt: %d)", err, lastAttempt)
+	}
+
+	// Should have checked context immediately, so 0 or very few attempts.
+	t.Logf("Cancelled after %d attempts", lastAttempt)
+}
+
+func TestComputePoWWithProgress_TimeoutCancellation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping PoW computation in short mode")
 	}
 
 	rootCID := "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
-	dataTXID := "cancel-test"
+	dataTXID := "timeout-test"
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	var lastAttempt uint64
@@ -141,7 +162,7 @@ func TestComputePoWWithProgress_Cancellation(t *testing.T) {
 		t.Errorf("expected ErrPoWCancelled, got %v (last attempt: %d)", err, lastAttempt)
 	}
 
-	t.Logf("Cancelled after %d attempts", lastAttempt)
+	t.Logf("Timeout after %d attempts", lastAttempt)
 }
 
 func TestComputePoWWithProgress_Callback(t *testing.T) {
