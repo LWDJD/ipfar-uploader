@@ -1,12 +1,15 @@
 package arweave
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -336,6 +339,24 @@ func newMockChunkedServer() *httptest.Server {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`"mock-anchor"`))
 
+		case strings.HasPrefix(r.URL.Path, "/raw/") && r.Method == "GET":
+			// Serve the first chunk for verification
+			txID := strings.TrimPrefix(r.URL.Path, "/raw/")
+			w.Header().Set("Content-Type", "application/octet-stream")
+			// Reconstruct the expected first chunk
+			// The test data is ChunkSize+100 bytes of i%256
+			chunkLen := ChunkSize
+			firstChunk := make([]byte, chunkLen)
+			for i := 0; i < chunkLen; i++ {
+				firstChunk[i] = byte(i % 256)
+			}
+			// Handle range request
+			if rng := r.Header.Get("Range"); rng != "" {
+				w.WriteHeader(http.StatusPartialContent)
+			}
+			w.Write(firstChunk)
+			_ = txID
+
 		case strings.HasPrefix(r.URL.Path, "/tx/") && r.Method == "GET":
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"block_height":2000000,"block_indep_hash":"mock-hash"}`))
@@ -532,6 +553,249 @@ func TestUploadDataChunked_SignatureValid(t *testing.T) {
 	}
 
 	t.Logf("Chunked tx signature valid: id=%s", tx.ID)
+}
+
+// =============================================================================
+// Streaming Merkle tree tests
+// =============================================================================
+
+func TestComputeMerkleTreeFromReader_MatchesInMemory(t *testing.T) {
+	// Verify that the streaming Merkle tree produces the same root as the
+	// in-memory version for various data sizes.
+	sizes := []int{
+		0,
+		100,
+		ChunkSize,
+		ChunkSize + 1,
+		ChunkSize * 2,
+		ChunkSize*2 + ChunkSize/2,
+		ChunkSize * 5,
+	}
+
+	for _, size := range sizes {
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(i % 256)
+		}
+
+		// In-memory
+		rootMem, _ := computeChunksAndProofs(data)
+
+		// Streaming via bytes.NewReader
+		reader := bytes.NewReader(data)
+		rootStream, nodesStream, nChunks, leafHashes, err := computeMerkleTreeFromReader(reader, int64(size))
+		if err != nil {
+			t.Fatalf("size=%d: streaming tree failed: %v", size, err)
+		}
+
+		if !bytes.Equal(rootMem, rootStream) {
+			t.Errorf("size=%d: root mismatch; in-memory=%x streaming=%x", size, rootMem, rootStream)
+		}
+
+		// Verify leaf hashes match chunk hashes
+		if nChunks > 0 {
+			if len(leafHashes) != nChunks {
+				t.Errorf("size=%d: expected %d leaf hashes, got %d", size, nChunks, len(leafHashes))
+			}
+
+			// Spot-check: verify each leaf hash against directly computed hash
+			for i := 0; i < nChunks; i++ {
+				start := i * ChunkSize
+				end := start + ChunkSize
+				if end > size {
+					end = size
+				}
+				expectedHash := sha256.Sum256(data[start:end])
+				if !bytes.Equal(leafHashes[i], expectedHash[:]) {
+					t.Errorf("size=%d chunk %d: leaf hash mismatch", size, i)
+				}
+			}
+
+			// Verify proof for each chunk
+			_ = nodesStream
+			for i := 0; i < nChunks; i++ {
+				proof := collectProof(nodesStream, i, nChunks)
+				start := i * ChunkSize
+				end := start + ChunkSize
+				if end > size {
+					end = size
+				}
+				// Verify using the in-memory verification helper
+				cp := chunkProof{
+					Offset: start,
+					Chunk:  data[start:end],
+					Proof:  proof,
+				}
+				if !verifyProof(cp, rootStream, nChunks) {
+					t.Errorf("size=%d chunk %d: proof verification failed", size, i)
+				}
+			}
+		}
+	}
+}
+
+// =============================================================================
+// Reader error handling tests
+// =============================================================================
+
+type brokenReaderAt struct {
+	data       []byte
+	failAtByte int64 // return an error after reading this many bytes
+}
+
+func (b *brokenReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(b.data)) {
+		return 0, io.EOF
+	}
+	if b.failAtByte >= 0 && off >= b.failAtByte {
+		return 0, fmt.Errorf("simulated read error at offset %d", off)
+	}
+	end := off + int64(len(p))
+	if end > int64(len(b.data)) {
+		end = int64(len(b.data))
+	}
+	n := copy(p, b.data[off:end])
+	if off+int64(n) >= int64(len(b.data)) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func TestComputeMerkleTreeFromReader_ReadError(t *testing.T) {
+	data := make([]byte, ChunkSize*3)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	// Fail at the second chunk (offset ChunkSize)
+	broken := &brokenReaderAt{data: data, failAtByte: ChunkSize}
+	_, _, _, _, err := computeMerkleTreeFromReader(broken, int64(len(data)))
+	if err == nil {
+		t.Fatal("expected error from broken reader, got nil")
+	}
+	t.Logf("Got expected error: %v", err)
+}
+
+func TestUploadChunksStreaming_ReadError(t *testing.T) {
+	// Test that second-pass read errors are propagated
+	data := make([]byte, ChunkSize*2)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	// First pass succeeds (use a good reader)
+	goodReader := bytes.NewReader(data)
+	_, nodes, nChunks, _, err := computeMerkleTreeFromReader(goodReader, int64(len(data)))
+	if err != nil {
+		t.Fatalf("first pass failed: %v", err)
+	}
+
+	// Second pass: break at offset zero (first chunk read fails)
+	broken := &brokenReaderAt{data: data, failAtByte: 0}
+
+	server := newMockChunkedServer()
+	defer server.Close()
+	client := NewGatewayClient(server.URL)
+
+	err = client.uploadChunksStreaming("mock-root", len(data), broken, nodes, nChunks)
+	if err == nil {
+		t.Fatal("expected error from broken reader in second pass, got nil")
+	}
+	t.Logf("Got expected second-pass error: %v", err)
+}
+
+// =============================================================================
+// Data corruption detection tests
+// =============================================================================
+
+func TestVerifyFirstChunk_Success(t *testing.T) {
+	// Create test data and a mock server that returns the correct first chunk
+	data := make([]byte, ChunkSize*2)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	expectedHash := sha256.Sum256(data[:ChunkSize])
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/raw/") {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			if r.Header.Get("Range") != "" {
+				w.WriteHeader(http.StatusPartialContent)
+			}
+			w.Write(data[:ChunkSize])
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewGatewayClient(server.URL)
+	err := client.verifyFirstChunk("test-tx-id", expectedHash[:], int64(len(data)))
+	if err != nil {
+		t.Fatalf("verifyFirstChunk should succeed: %v", err)
+	}
+}
+
+func TestVerifyFirstChunk_Corruption(t *testing.T) {
+	// Return corrupted data → verification must fail
+	data := make([]byte, ChunkSize*2)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	expectedHash := sha256.Sum256(data[:ChunkSize])
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/raw/") {
+			// Return CORRUPTED data (all zeros instead of pattern)
+			corrupted := make([]byte, ChunkSize)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			if r.Header.Get("Range") != "" {
+				w.WriteHeader(http.StatusPartialContent)
+			}
+			w.Write(corrupted)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewGatewayClient(server.URL)
+	err := client.verifyFirstChunk("test-tx-id", expectedHash[:], int64(len(data)))
+	if err == nil {
+		t.Fatal("verifyFirstChunk MUST return an error for corrupted data")
+	}
+	t.Logf("Corruption correctly detected: %v", err)
+}
+
+func TestVerifyFirstChunk_EmptyResponse(t *testing.T) {
+	// Empty response body → verification must fail
+	data := make([]byte, ChunkSize)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	expectedHash := sha256.Sum256(data)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/raw/") {
+			// Return empty body (data not available yet)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusOK)
+			// No body written
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewGatewayClient(server.URL)
+	err := client.verifyFirstChunk("test-tx-id", expectedHash[:], int64(len(data)))
+	if err == nil {
+		t.Fatal("verifyFirstChunk MUST return an error for empty response")
+	}
+	t.Logf("Empty response correctly detected: %v", err)
 }
 
 // =============================================================================

@@ -3,13 +3,16 @@
 // Arweave v2 nodes expose POST /chunk for uploading data in 256 KiB chunks,
 // bypassing nginx 413 body size limits on POST /tx (typically ~1–2 MiB).
 //
-// Flow:
-//  1. Split data into chunks and compute a Merkle tree → data_root.
-//  2. POST each chunk to /chunk with its Merkle proof.
-//  3. POST the transaction to /tx with data_root / data_size but no data field.
-//  4. Confirm as usual.
+// Flow (two-pass streaming):
+//  1. First pass:  stream data via io.ReaderAt, compute SHA-256 leaf hashes
+//     and build a Merkle tree → data_root.  Only tree nodes (32 B each) stay
+//     in memory.
+//  2. Second pass: re-read data via io.ReaderAt, upload each chunk + Merkle
+//     proof to /chunk.  Memory: 256 KiB buffer.
+//  3. Build & sign tx, POST /tx, confirm.
+//  4. Verify the first chunk via GET /raw/{txID} (Range request).
 //
-// For data < 256 KiB the classic single-POST /tx path is used transparently.
+// Legacy inline-data path (UploadData) is auto-selected for data < 256 KiB.
 package arweave
 
 import (
@@ -32,13 +35,14 @@ import (
 const ChunkSize = 256 * 1024
 
 // =============================================================================
-// Merkle tree utilities
+// Merkle tree types
 // =============================================================================
 
-// chunkProof holds the Merkle proof for a single chunk.
+// chunkProof holds the Merkle proof for a single chunk (includes chunk data
+// for the legacy all-in-memory path).
 type chunkProof struct {
 	Offset int    // byte offset of this chunk in the original data
-	Chunk  []byte // raw chunk bytes
+	Chunk  []byte // raw chunk bytes (subslice of data in legacy path)
 	Proof  []byte // concatenated sibling hashes from leaf to root
 }
 
@@ -49,6 +53,10 @@ type merkleNode struct {
 	right  int    // index of right child (-1 if leaf or promoted)
 }
 
+// =============================================================================
+// Legacy in-memory Merkle tree (kept for backward compat and tests)
+// =============================================================================
+
 // computeChunksAndProofs splits data into fixed-size chunks, builds a Merkle
 // tree, and returns every chunk together with its inclusion proof.
 //
@@ -57,13 +65,12 @@ type merkleNode struct {
 func computeChunksAndProofs(data []byte) (dataRoot []byte, results []chunkProof) {
 	nChunks := (len(data) + ChunkSize - 1) / ChunkSize
 	if nChunks == 0 {
-		// Empty data → SHA-256 of empty byte slice as root.
 		h := sha256.Sum256(nil)
 		return h[:], nil
 	}
 
 	// ---- 1. leaf hashes ----
-	nodes := make([]merkleNode, 0, nChunks*2) // pre-allocate for the whole tree
+	nodes := make([]merkleNode, 0, nChunks*2)
 
 	for i := 0; i < nChunks; i++ {
 		start := i * ChunkSize
@@ -83,7 +90,6 @@ func computeChunksAndProofs(data []byte) (dataRoot []byte, results []chunkProof)
 		for i := 0; i < levelCount; i += 2 {
 			leftIdx := levelStart + i
 			if i+1 < levelCount {
-				// Two children → hash(left || right)
 				rightIdx := levelStart + i + 1
 				combined := make([]byte, 64)
 				copy(combined[:32], nodes[leftIdx].hash)
@@ -95,11 +101,10 @@ func computeChunksAndProofs(data []byte) (dataRoot []byte, results []chunkProof)
 					right: rightIdx,
 				})
 			} else {
-				// Odd node → promote
 				nodes = append(nodes, merkleNode{
 					hash:  nodes[leftIdx].hash,
 					left:  leftIdx,
-					right: -1, // promoted, no right sibling
+					right: -1,
 				})
 			}
 		}
@@ -107,7 +112,6 @@ func computeChunksAndProofs(data []byte) (dataRoot []byte, results []chunkProof)
 		levelCount = (levelCount + 1) / 2
 	}
 
-	// Root is the last node
 	rootIdx := len(nodes) - 1
 	dataRoot = nodes[rootIdx].hash
 
@@ -131,6 +135,127 @@ func computeChunksAndProofs(data []byte) (dataRoot []byte, results []chunkProof)
 	return dataRoot, results
 }
 
+// =============================================================================
+// Streaming Merkle tree (two-pass friendly)
+// =============================================================================
+
+// computeMerkleTreeFromReader computes the Merkle tree by streaming data
+// from an io.ReaderAt.  Only tree node hashes (32 B per node) are kept in
+// memory; chunk data is discarded after hashing.
+//
+// Returns:
+//   - dataRoot:      Merkle root (32 bytes)
+//   - nodes:         full Merkle tree node slice (needed to generate proofs)
+//   - nChunks:       total number of leaf chunks
+//   - leafHashes:    SHA-256 hashes of every leaf (32 B each; used for
+//                    post-upload verification)
+func computeMerkleTreeFromReader(r io.ReaderAt, dataSize int64) (
+	dataRoot []byte,
+	nodes []merkleNode,
+	nChunks int,
+	leafHashes [][]byte,
+	err error,
+) {
+	if dataSize == 0 {
+		h := sha256.Sum256(nil)
+		return h[:], nil, 0, nil, nil
+	}
+
+	nChunks = int((dataSize + ChunkSize - 1) / ChunkSize)
+
+	// ---- 1. read each chunk and compute leaf hashes ----
+	buf := make([]byte, ChunkSize)
+	leafHashes = make([][]byte, nChunks)
+	// Pre-allocate enough capacity for the full Merkle tree.
+	// Maximum node count: leaves + sum_{k>=1} ceil(leaves/2^k) ≤ 2*leaves + 1.
+	nodes = make([]merkleNode, 0, nChunks*2+1)
+
+	for i := 0; i < nChunks; i++ {
+		offset := int64(i) * ChunkSize
+		end := offset + ChunkSize
+		if end > dataSize {
+			end = dataSize
+		}
+		chunkLen := int(end - offset)
+
+		n, readErr := readFullAt(r, buf[:chunkLen], offset)
+		if readErr != nil {
+			err = fmt.Errorf("read chunk %d at offset %d: %w", i, offset, readErr)
+			return
+		}
+		if n < chunkLen {
+			err = fmt.Errorf("short read at chunk %d: got %d bytes, want %d", i, n, chunkLen)
+			return
+		}
+
+		h := sha256.Sum256(buf[:chunkLen])
+		leafHashes[i] = make([]byte, 32)
+		copy(leafHashes[i], h[:])
+		nodes = append(nodes, merkleNode{hash: leafHashes[i], left: -1, right: -1})
+	}
+
+	// ---- 2. build tree bottom-up ----
+	dataRoot, nodes = buildMerkleTree(nodes, nChunks)
+
+	return dataRoot, nodes, nChunks, leafHashes, nil
+}
+
+// buildMerkleTree builds the internal Merkle tree levels on top of existing
+// leaf nodes.  `nodes` must already contain the nChunks leaf nodes at the
+// front.  Returns the Merkle root hash and the (possibly reallocated) node
+// slice.
+func buildMerkleTree(nodes []merkleNode, nChunks int) ([]byte, []merkleNode) {
+	levelStart := 0
+	levelCount := nChunks
+	for levelCount > 1 {
+		nextLevelStart := len(nodes)
+		for i := 0; i < levelCount; i += 2 {
+			leftIdx := levelStart + i
+			if i+1 < levelCount {
+				rightIdx := levelStart + i + 1
+				combined := make([]byte, 64)
+				copy(combined[:32], nodes[leftIdx].hash)
+				copy(combined[32:], nodes[rightIdx].hash)
+				h := sha256.Sum256(combined)
+				nodes = append(nodes, merkleNode{
+					hash:  h[:],
+					left:  leftIdx,
+					right: rightIdx,
+				})
+			} else {
+				// Odd node → promote
+				nodes = append(nodes, merkleNode{
+					hash:  nodes[leftIdx].hash,
+					left:  leftIdx,
+					right: -1,
+				})
+			}
+		}
+		levelStart = nextLevelStart
+		levelCount = (levelCount + 1) / 2
+	}
+
+	return nodes[len(nodes)-1].hash, nodes
+}
+
+// readFullAt reads exactly len(buf) bytes from r starting at offset.
+// For the last partial chunk where ReadAt returns io.EOF, the bytes
+// successfully read are returned with a nil error.
+func readFullAt(r io.ReaderAt, buf []byte, offset int64) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := r.ReadAt(buf[total:], offset+int64(total))
+		total += n
+		if err != nil {
+			if err == io.EOF {
+				return total, nil
+			}
+			return total, err
+		}
+	}
+	return total, nil
+}
+
 // collectProof walks up the Merkle tree from leafIdx and collects sibling
 // hashes at each level.  nodes is the full node slice; leafCount is the
 // original number of leaves (nChunks).
@@ -143,10 +268,8 @@ func collectProof(nodes []merkleNode, leafIdx int, leafCount int) []byte {
 	for levelCount > 1 {
 		siblingIdx := idx ^ 1 // flip LSB to get sibling index
 		if siblingIdx < levelCount {
-			// Sibling exists → append its hash
 			proof.Write(nodes[levelStart+siblingIdx].hash)
 		}
-		// Move to parent level
 		idx = idx / 2
 		levelStart = levelStart + levelCount
 		levelCount = (levelCount + 1) / 2
@@ -240,7 +363,6 @@ func buildChunkedTransaction(owner string, dataSize int, dataRoot string, tags [
 
 // submitChunkedTransaction posts a transaction without data to /tx.
 func (gc *GatewayClient) submitChunkedTransaction(tx *Transaction) (string, error) {
-	// Serialise *without* the data field.
 	txNoData := TransactionWithoutData{
 		Format:    tx.Format,
 		ID:        tx.ID,
@@ -280,25 +402,137 @@ func (gc *GatewayClient) submitChunkedTransaction(tx *Transaction) (string, erro
 }
 
 // =============================================================================
-// Public API
+// Streaming chunk upload (second pass)
 // =============================================================================
 
-// UploadDataChunked uploads data to Arweave using the chunked /chunk endpoint.
-// It always uses the chunked flow regardless of data size.  For datasets
-// smaller than 256 KiB, UploadData (which auto-detects size) is more efficient.
-func (gc *GatewayClient) UploadDataChunked(wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
-	dataSize := len(data)
+// uploadChunksStreaming re-reads data from reader, collects Merkle proofs
+// from the pre-computed tree nodes, and uploads each chunk to /chunk.
+func (gc *GatewayClient) uploadChunksStreaming(
+	dataRoot string,
+	dataSize int,
+	reader io.ReaderAt,
+	nodes []merkleNode,
+	nChunks int,
+) error {
+	buf := make([]byte, ChunkSize)
 
-	// ---- 1. compute Merkle tree ----
-	dataRootHash, chunkProofs := computeChunksAndProofs(data)
+	for i := 0; i < nChunks; i++ {
+		offset := i * ChunkSize
+		end := offset + ChunkSize
+		if end > dataSize {
+			end = dataSize
+		}
+		chunkLen := end - offset
+
+		n, readErr := readFullAt(reader, buf[:chunkLen], int64(offset))
+		if readErr != nil {
+			return fmt.Errorf("second pass: read chunk %d at offset %d: %w", i, offset, readErr)
+		}
+		if n < chunkLen {
+			return fmt.Errorf("second pass: short read at chunk %d: got %d, want %d", i, n, chunkLen)
+		}
+
+		proof := collectProof(nodes, i, nChunks)
+		dataPath := base64.RawURLEncoding.EncodeToString(proof)
+
+		if err := gc.submitChunk(dataRoot, dataSize, dataPath, offset, buf[:chunkLen]); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// =============================================================================
+// Data verification
+// =============================================================================
+
+// verifyFirstChunk downloads the first chunk from the gateway and verifies
+// that its SHA-256 matches expectedLeafHash.
+//
+// Uses an HTTP Range request to avoid downloading the entire file.
+func (gc *GatewayClient) verifyFirstChunk(txID string, expectedLeafHash []byte, dataSize int64) error {
+	if len(expectedLeafHash) != 32 {
+		return fmt.Errorf("invalid expected leaf hash length: %d", len(expectedLeafHash))
+	}
+
+	// Determine how many bytes to fetch
+	fetchLen := ChunkSize
+	if dataSize < int64(ChunkSize) {
+		fetchLen = int(dataSize)
+	}
+
+	req, err := http.NewRequest("GET", gc.GatewayURL+"/raw/"+txID, nil)
+	if err != nil {
+		return fmt.Errorf("verify: failed to create request: %w", err)
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", fetchLen-1))
+
+	resp, err := gc.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("verify: failed to download first chunk: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Accept 206 Partial Content and 200 OK (some gateways ignore Range)
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("verify: gateway returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	downloaded, err := io.ReadAll(io.LimitReader(resp.Body, int64(fetchLen)))
+	if err != nil {
+		return fmt.Errorf("verify: failed to read downloaded chunk: %w", err)
+	}
+
+	if len(downloaded) == 0 {
+		return fmt.Errorf("verify: downloaded chunk is empty — data may not be available yet")
+	}
+
+	actualHash := sha256.Sum256(downloaded)
+
+	if !bytes.Equal(actualHash[:], expectedLeafHash) {
+		return fmt.Errorf(
+			"DATA VERIFICATION FAILED: first chunk hash mismatch.\n"+
+				"  Expected: %x\n"+
+				"  Got:      %x\n"+
+				"  The uploaded data may be corrupted. Do not trust this transaction.",
+			expectedLeafHash, actualHash[:],
+		)
+	}
+
+	return nil
+}
+
+// =============================================================================
+// Public API — streaming (primary)
+// =============================================================================
+
+// UploadDataChunkedStreaming uploads data to Arweave using the chunked
+// /chunk endpoint with two-pass streaming.
+//
+// Pass 1:  compute Merkle tree via io.ReaderAt (only hashes in memory).
+// Pass 2:  re-read and upload each chunk + Merkle proof (256 KiB buffer).
+// Pass 3:  build, sign, submit the transaction and wait for confirmation.
+// Pass 4:  verify the first chunk against the gateway.
+//
+// The reader must support io.ReaderAt (e.g. *os.File, *bytes.Reader).
+func (gc *GatewayClient) UploadDataChunkedStreaming(
+	wallet *Wallet,
+	reader io.ReaderAt,
+	dataSize int64,
+	tags []Tag,
+) (*Transaction, *TransactionStatus, error) {
+	// ---- 1. first pass: compute Merkle tree ----
+	dataRootHash, nodes, nChunks, leafHashes, err := computeMerkleTreeFromReader(reader, dataSize)
+	if err != nil {
+		return nil, nil, fmt.Errorf("first pass (Merkle tree): %w", err)
+	}
 	dataRoot := base64.RawURLEncoding.EncodeToString(dataRootHash)
 
-	// ---- 2. upload every chunk ----
-	for _, cp := range chunkProofs {
-		dataPath := base64.RawURLEncoding.EncodeToString(cp.Proof)
-		if err := gc.submitChunk(dataRoot, dataSize, dataPath, cp.Offset, cp.Chunk); err != nil {
-			return nil, nil, err
-		}
+	// ---- 2. second pass: upload chunks ----
+	if err := gc.uploadChunksStreaming(dataRoot, int(dataSize), reader, nodes, nChunks); err != nil {
+		return nil, nil, fmt.Errorf("second pass (chunk upload): %w", err)
 	}
 
 	// ---- 3. fetch anchor & reward ----
@@ -307,13 +541,13 @@ func (gc *GatewayClient) UploadDataChunked(wallet *Wallet, data []byte, tags []T
 		anchor = ""
 	}
 
-	reward, err := gc.GetReward(int64(dataSize))
+	reward, err := gc.GetReward(dataSize)
 	if err != nil {
 		reward = "0"
 	}
 
 	// ---- 4. build & sign transaction ----
-	tx := buildChunkedTransaction(wallet.Owner, dataSize, dataRoot, tags, reward, anchor)
+	tx := buildChunkedTransaction(wallet.Owner, int(dataSize), dataRoot, tags, reward, anchor)
 	if err := tx.Sign(wallet.PrivateKey); err != nil {
 		return nil, nil, fmt.Errorf("failed to sign chunked tx: %w", err)
 	}
@@ -331,5 +565,28 @@ func (gc *GatewayClient) UploadDataChunked(wallet *Wallet, data []byte, tags []T
 		return tx, nil, fmt.Errorf("submitted but unconfirmed: %w", err)
 	}
 
+	// ---- 7. verify first chunk integrity ----
+	if nChunks > 0 && len(leafHashes) > 0 {
+		if verr := gc.verifyFirstChunk(txID, leafHashes[0], dataSize); verr != nil {
+			// Do NOT silently fail — verification errors must be surfaced.
+			return tx, status, fmt.Errorf("post-upload verification failed: %w", verr)
+		}
+	}
+
 	return tx, status, nil
+}
+
+// =============================================================================
+// Public API — backward compatible (all-in-memory)
+// =============================================================================
+
+// UploadDataChunked uploads data to Arweave using the chunked /chunk endpoint.
+// It always uses the chunked flow regardless of data size.  For datasets
+// smaller than 256 KiB, UploadData (which auto-detects size) is more efficient.
+//
+// This is a convenience wrapper around UploadDataChunkedStreaming that accepts
+// a []byte.  For large data, prefer UploadDataChunkedStreaming with an
+// io.ReaderAt to avoid keeping the full payload in memory.
+func (gc *GatewayClient) UploadDataChunked(wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
+	return gc.UploadDataChunkedStreaming(wallet, bytes.NewReader(data), int64(len(data)), tags)
 }
