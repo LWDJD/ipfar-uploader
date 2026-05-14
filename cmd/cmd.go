@@ -18,6 +18,7 @@ var (
 	gatewayURL string
 	useBundle  bool
 	bundleSize int
+	powWorkers int
 )
 
 // Run parses command-line arguments and executes the appropriate command.
@@ -57,6 +58,7 @@ func runFile(ctx context.Context, args []string) error {
 	fs.StringVar(&gatewayURL, "gateway", "https://arweave.net", "Arweave gateway URL")
 	fs.BoolVar(&useBundle, "bundle", false, "Use ANS-104 bundle upload")
 	fs.IntVar(&bundleSize, "bundle-size", 0, "Max items per bundle (0 = all in one)")
+	fs.IntVar(&powWorkers, "pow-workers", 0, "Number of parallel PoW workers (0 = auto)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -76,6 +78,7 @@ func runDir(ctx context.Context, args []string) error {
 	fs.StringVar(&gatewayURL, "gateway", "https://arweave.net", "Arweave gateway URL")
 	fs.BoolVar(&useBundle, "bundle", false, "Use ANS-104 bundle upload")
 	fs.IntVar(&bundleSize, "bundle-size", 0, "Max items per bundle (0 = all in one)")
+	fs.IntVar(&powWorkers, "pow-workers", 0, "Number of parallel PoW workers (0 = auto)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -190,6 +193,7 @@ func buildConfig() (*uploader.Config, error) {
 	cfg.Gateway = arweave.NewGatewayClient(gatewayURL)
 	cfg.UseBundle = useBundle
 	cfg.BundleSize = bundleSize
+	cfg.PoWWorkers = powWorkers
 
 	return cfg, nil
 }

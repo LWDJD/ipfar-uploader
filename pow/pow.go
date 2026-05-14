@@ -39,9 +39,9 @@ var (
 	ErrPoWCancelled          = errors.New("PoW computation cancelled")
 )
 
-// defaultWorkers returns the recommended number of parallel PoW workers.
+// DefaultWorkers returns the recommended number of parallel PoW workers.
 // Caps at 4 to stay within reasonable memory limits (~80 MB for 4 workers).
-func defaultWorkers() int {
+func DefaultWorkers() int {
 	n := runtime.NumCPU()
 	if n > 4 {
 		n = 4
@@ -223,7 +223,7 @@ func FastComputePoWParallel(ctx context.Context, rootCID, dataTXID string, numWo
 // computePoWParallel is the shared parallel search implementation.
 func computePoWParallel(ctx context.Context, rootCID, dataTXID string, numWorkers int, memoryKB uint32) (string, error) {
 	if numWorkers <= 0 {
-		numWorkers = defaultWorkers()
+		numWorkers = DefaultWorkers()
 	}
 
 	ctx, cancel := context.WithCancel(ctx)

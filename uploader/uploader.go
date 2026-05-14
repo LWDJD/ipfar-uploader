@@ -22,6 +22,7 @@ type Config struct {
 	Gateway    *arweave.GatewayClient
 	UseBundle  bool
 	BundleSize int // max items per bundle (0 = all in one)
+	PoWWorkers int // number of parallel PoW workers (0 = use pow.DefaultWorkers())
 }
 
 // NewDefaultConfig creates a config with default Arweave.net gateway.
@@ -90,8 +91,9 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 
 	// 3. Compute PoW if needed (first pass with empty data_txid)
 	if pow.NeedsPoW(result.DataSize) {
-		fmt.Printf("   Computing PoW (Argon2id 20MB/1/1, parallel)...")
-		powSalt, err := pow.ComputePoWParallel(ctx, result.RootCID, "", 0)
+		powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
+		fmt.Printf("   Computing PoW (Argon2id 20MB/1/1, workers=%d)...", powWorkers)
+		powSalt, err := pow.ComputePoWParallel(ctx, result.RootCID, "", u.cfg.PoWWorkers)
 		if err != nil {
 			result.Error = fmt.Errorf("PoW computation failed: %w", err)
 			return result, result.Error
@@ -155,8 +157,9 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 
 	// 5. Recompute PoW with actual data_txid
 	if pow.NeedsPoW(result.DataSize) {
-		fmt.Printf("   Recomputing PoW with data_txid (parallel)...")
-		powSalt, err := pow.ComputePoWParallel(ctx, result.RootCID, result.DataTXID, 0)
+		powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
+		fmt.Printf("   Recomputing PoW with data_txid (workers=%d)...", powWorkers)
+		powSalt, err := pow.ComputePoWParallel(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers)
 		if err != nil {
 			result.Error = fmt.Errorf("PoW recomputation failed: %w", err)
 			return result, result.Error
@@ -271,4 +274,12 @@ func toArweaveTags(tags []metadata.Tag) []arweave.Tag {
 		result[i] = arweave.Tag{Name: t.Name, Value: t.Value}
 	}
 	return result
+}
+
+// effectivePoWWorkers returns the actual number of PoW workers to use.
+func effectivePoWWorkers(cfgWorkers int) int {
+	if cfgWorkers > 0 {
+		return cfgWorkers
+	}
+	return pow.DefaultWorkers()
 }
