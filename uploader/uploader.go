@@ -87,8 +87,10 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 		result.Error = fmt.Errorf("failed to create CAR v2: %w", err)
 		return result, result.Error
 	}
+	const expectedTotal = 65536 // 2^16 average expected attempts
 	result.RootCID = rootCID.String()
 
+	// 3. Compute PoW if needed (first pass with empty data_txid)
 	// 3. Compute PoW if needed (first pass with empty data_txid)
 	if pow.NeedsPoW(result.DataSize) {
 		powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
@@ -102,8 +104,27 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 				return
 			}
 			lastPrint = now
-			fmt.Printf("\r   Computing PoW (%d workers): %s hashes (%s), best salt=%d     ",
-				powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), info.BestSalt)
+			pct := float64(info.Attempts) / float64(expectedTotal) * 100
+			eta := ""
+			if info.Speed > 0 {
+				remaining := int((float64(expectedTotal) - float64(info.Attempts)) / info.Speed)
+				if remaining > 0 {
+					if remaining >= 3600 {
+						eta = fmt.Sprintf("%dh%dm", remaining/3600, (remaining%3600)/60)
+					} else if remaining >= 60 {
+						eta = fmt.Sprintf("%dm%ds", remaining/60, remaining%60)
+					} else {
+						eta = fmt.Sprintf("%ds", remaining)
+					}
+				}
+			}
+			if eta != "" {
+				fmt.Printf("\r   Computing PoW (%d workers): %s hashes (%s) - %.1f%% ETA %s, best salt=%d     ",
+					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, eta, info.BestSalt)
+			} else {
+				fmt.Printf("\r   Computing PoW (%d workers): %s hashes (%s) - %.1f%%, best salt=%d     ",
+					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, info.BestSalt)
+			}
 		}
 
 		powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, "", u.cfg.PoWWorkers, progress)
@@ -116,7 +137,6 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 	} else {
 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
 	}
-
 	// 4. Upload CAR file to Arweave
 	method := metadata.MethodRaw
 	if u.cfg.UseBundle {
@@ -179,8 +199,27 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 				return
 			}
 			lastPrint2 = now
-			fmt.Printf("\r   Recomputing PoW (%d workers): %s hashes (%s), best salt=%d     ",
-				powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), info.BestSalt)
+			pct := float64(info.Attempts) / float64(expectedTotal) * 100
+			eta := ""
+			if info.Speed > 0 {
+				remaining := int((float64(expectedTotal) - float64(info.Attempts)) / info.Speed)
+				if remaining > 0 {
+					if remaining >= 3600 {
+						eta = fmt.Sprintf("%dh%dm", remaining/3600, (remaining%3600)/60)
+					} else if remaining >= 60 {
+						eta = fmt.Sprintf("%dm%ds", remaining/60, remaining%60)
+					} else {
+						eta = fmt.Sprintf("%ds", remaining)
+					}
+				}
+			}
+			if eta != "" {
+				fmt.Printf("\r   Recomputing PoW (%d workers): %s hashes (%s) - %.1f%% ETA %s, best salt=%d     ",
+					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, eta, info.BestSalt)
+			} else {
+				fmt.Printf("\r   Recomputing PoW (%d workers): %s hashes (%s) - %.1f%%, best salt=%d     ",
+					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, info.BestSalt)
+			}
 		}
 		powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers, progress2)
 		if err != nil {
