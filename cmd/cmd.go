@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -20,7 +21,8 @@ var (
 )
 
 // Run parses command-line arguments and executes the appropriate command.
-func Run() error {
+// ctx is used for cancellation (e.g. SIGINT).
+func Run(ctx context.Context) error {
 	if len(os.Args) < 2 {
 		printUsage()
 		return fmt.Errorf("no command specified")
@@ -31,9 +33,9 @@ func Run() error {
 
 	switch cmd {
 	case "file":
-		return runFile(args)
+		return runFile(ctx, args)
 	case "dir":
-		return runDir(args)
+		return runDir(ctx, args)
 	case "wallet":
 		return runWallet(args)
 	case "help", "-h", "--help":
@@ -49,7 +51,7 @@ func Run() error {
 	}
 }
 
-func runFile(args []string) error {
+func runFile(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("file", flag.ExitOnError)
 	fs.StringVar(&walletPath, "wallet", "", "Path to Arweave JWK wallet file (required)")
 	fs.StringVar(&gatewayURL, "gateway", "https://arweave.net", "Arweave gateway URL")
@@ -65,10 +67,10 @@ func runFile(args []string) error {
 		return fmt.Errorf("file path required")
 	}
 
-	return uploadFile(filePath)
+	return uploadFile(ctx, filePath)
 }
 
-func runDir(args []string) error {
+func runDir(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("dir", flag.ExitOnError)
 	fs.StringVar(&walletPath, "wallet", "", "Path to Arweave JWK wallet file (required)")
 	fs.StringVar(&gatewayURL, "gateway", "https://arweave.net", "Arweave gateway URL")
@@ -84,7 +86,7 @@ func runDir(args []string) error {
 		return fmt.Errorf("directory path required")
 	}
 
-	return uploadDir(dirPath)
+	return uploadDir(ctx, dirPath)
 }
 
 func runWallet(args []string) error {
@@ -100,7 +102,6 @@ func runWallet(args []string) error {
 		return generateWallet(walletPath)
 	}
 
-	// Show wallet info
 	if walletPath == "" {
 		return fmt.Errorf("wallet path required (use --wallet <path>)")
 	}
@@ -108,7 +109,7 @@ func runWallet(args []string) error {
 	return showWallet(walletPath)
 }
 
-func uploadFile(filePath string) error {
+func uploadFile(ctx context.Context, filePath string) error {
 	cfg, err := buildConfig()
 	if err != nil {
 		return err
@@ -126,7 +127,7 @@ func uploadFile(filePath string) error {
 	fmt.Println()
 
 	u := uploader.New(cfg)
-	result, err := u.UploadFile(absPath)
+	result, err := u.UploadFile(ctx, absPath)
 	if err != nil {
 		return err
 	}
@@ -135,7 +136,7 @@ func uploadFile(filePath string) error {
 	return nil
 }
 
-func uploadDir(dirPath string) error {
+func uploadDir(ctx context.Context, dirPath string) error {
 	cfg, err := buildConfig()
 	if err != nil {
 		return err
@@ -153,7 +154,7 @@ func uploadDir(dirPath string) error {
 	fmt.Println()
 
 	u := uploader.New(cfg)
-	results, err := u.UploadDir(absPath)
+	results, err := u.UploadDir(ctx, absPath)
 	if err != nil {
 		return err
 	}
@@ -173,7 +174,6 @@ func uploadDir(dirPath string) error {
 
 func buildConfig() (*uploader.Config, error) {
 	if walletPath == "" {
-		// Check environment variable
 		walletPath = os.Getenv("IPFAR_WALLET")
 	}
 	if walletPath == "" {

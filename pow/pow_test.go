@@ -1,7 +1,9 @@
 package pow
 
 import (
+	"context"
 	"testing"
+	"time"
 )
 
 func TestNeedsPoW(t *testing.T) {
@@ -117,4 +119,56 @@ func TestComputePoW_SafetyLimit(t *testing.T) {
 	}
 
 	t.Logf("FastComputePoW result: salt=%s", salt)
+}
+
+func TestComputePoWWithProgress_Cancellation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping PoW computation in short mode")
+	}
+
+	rootCID := "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+	dataTXID := "cancel-test"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	var lastAttempt uint64
+	_, err := FastComputePoWWithProgress(ctx, rootCID, dataTXID, func(attempts uint64) {
+		lastAttempt = attempts
+	})
+
+	if err != ErrPoWCancelled {
+		t.Errorf("expected ErrPoWCancelled, got %v (last attempt: %d)", err, lastAttempt)
+	}
+
+	t.Logf("Cancelled after %d attempts", lastAttempt)
+}
+
+func TestComputePoWWithProgress_Callback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping PoW computation in short mode")
+	}
+
+	rootCID := "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+	dataTXID := "callback-test"
+
+	var callCount uint64
+	salt, err := FastComputePoWWithProgress(context.Background(), rootCID, dataTXID, func(attempts uint64) {
+		callCount++
+	})
+
+	if err != nil {
+		t.Fatalf("FastComputePoWWithProgress failed: %v", err)
+	}
+
+	if salt == "" {
+		t.Fatal("empty salt")
+	}
+
+	// Callback should be invoked at least once
+	if callCount == 0 {
+		t.Error("progress callback was never called")
+	}
+
+	t.Logf("Found salt=%s after %d callbacks", salt, callCount)
 }
