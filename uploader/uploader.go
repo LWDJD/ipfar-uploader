@@ -94,11 +94,16 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 		powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
 		fmt.Printf("   Computing PoW (%d workers)", powWorkers)
 
+		// 每秒显示一次进度
+		var lastPrint time.Time
 		progress := func(info pow.ProgressInfo) {
-			if info.Attempts > 0 && info.Attempts%10000 == 0 {
-				fmt.Printf("\r   Computing PoW (%d workers): %s hashes (%s), best salt=%d",
-					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), info.BestSalt)
+			now := time.Now()
+			if info.Attempts == 0 || now.Sub(lastPrint) < time.Second {
+				return
 			}
+			lastPrint = now
+			fmt.Printf("\r   Computing PoW (%d workers): %s hashes (%s), best salt=%d     ",
+				powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), info.BestSalt)
 		}
 
 		powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, "", u.cfg.PoWWorkers, progress)
@@ -167,11 +172,15 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 	if pow.NeedsPoW(result.DataSize) {
 		powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
 		fmt.Printf("   Recomputing PoW with data_txid (%d workers)", powWorkers)
+		var lastPrint2 time.Time
 		progress2 := func(info pow.ProgressInfo) {
-			if info.Attempts > 0 && info.Attempts%10000 == 0 {
-				fmt.Printf("\r   Recomputing PoW (%d workers): %s hashes (%s), best salt=%d",
-					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), info.BestSalt)
+			now := time.Now()
+			if info.Attempts == 0 || now.Sub(lastPrint2) < time.Second {
+				return
 			}
+			lastPrint2 = now
+			fmt.Printf("\r   Recomputing PoW (%d workers): %s hashes (%s), best salt=%d     ",
+				powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), info.BestSalt)
 		}
 		powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers, progress2)
 		if err != nil {
