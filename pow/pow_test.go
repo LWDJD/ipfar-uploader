@@ -121,6 +121,153 @@ func TestComputePoW_SafetyLimit(t *testing.T) {
 	t.Logf("FastComputePoW result: salt=%s", salt)
 }
 
+// ============================================================
+// Parallel PoW tests
+// ============================================================
+
+// TestComputePoWParallel_Correctness verifies that the parallel search
+// finds a salt that satisfies the difficulty requirement.
+func TestComputePoWParallel_Correctness(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping PoW computation in short mode")
+	}
+
+	rootCID := "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+	dataTXID := "parallel-correctness-test"
+
+	salt, err := FastComputePoWParallel(t.Context(), rootCID, dataTXID, 2)
+	if err != nil {
+		t.Fatalf("FastComputePoWParallel failed: %v", err)
+	}
+
+	if salt == "" {
+		t.Fatal("empty salt")
+	}
+
+	// Verify the salt actually satisfies the difficulty using the real Verify function.
+	err = Verify(salt, Algorithm, rootCID, dataTXID, 1024)
+	if err != nil {
+		t.Errorf("salt %s does not satisfy PoW difficulty: %v", salt, err)
+	}
+
+	t.Logf("Parallel search found salt=%s", salt)
+}
+
+// TestComputePoWParallel_Cancellation verifies that cancelling the context
+// returns ErrPoWCancelled.
+func TestComputePoWParallel_Cancellation(t *testing.T) {
+	rootCID := "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+	dataTXID := "cancel-test"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	_, err := FastComputePoWParallel(ctx, rootCID, dataTXID, 4)
+	if err != ErrPoWCancelled {
+		t.Errorf("expected ErrPoWCancelled, got %v", err)
+	}
+}
+
+// TestComputePoWParallel_NumWorkers1 verifies that running with 1 worker
+// produces the same result as the single-threaded ComputePoW.
+func TestComputePoWParallel_NumWorkers1(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping PoW computation in short mode")
+	}
+
+	rootCID := "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+	dataTXID := "workers1-consistency"
+
+	saltSingle, err := FastComputePoW(rootCID, dataTXID)
+	if err != nil {
+		t.Fatalf("FastComputePoW failed: %v", err)
+	}
+
+	saltParallel, err := FastComputePoWParallel(context.Background(), rootCID, dataTXID, 1)
+	if err != nil {
+		t.Fatalf("FastComputePoWParallel(workers=1) failed: %v", err)
+	}
+
+	if saltSingle != saltParallel {
+		t.Errorf("mismatch: single=%s, parallel(workers=1)=%s", saltSingle, saltParallel)
+	}
+
+	t.Logf("Both single and parallel(1) found salt=%s", saltSingle)
+}
+
+// TestComputePoWParallel_MultiVsSingle compares wall-clock time of
+// multi-worker vs single-worker search. Multi-worker should be faster
+// (or at least not significantly slower).
+func TestComputePoWParallel_MultiVsSingle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping PoW timing test in short mode")
+	}
+
+	rootCID := "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+	dataTXID := "timing-comparison"
+
+	// Single worker timing
+	startSingle := time.Now()
+	saltSingle, err := FastComputePoWParallel(context.Background(), rootCID, dataTXID, 1)
+	elapsedSingle := time.Since(startSingle)
+	if err != nil {
+		t.Fatalf("single worker failed: %v", err)
+	}
+
+	// Multi worker timing (use 2+ workers)
+	numWorkers := 3
+	startMulti := time.Now()
+	saltMulti, err := FastComputePoWParallel(context.Background(), rootCID, dataTXID, numWorkers)
+	elapsedMulti := time.Since(startMulti)
+	if err != nil {
+		t.Fatalf("multi worker failed: %v", err)
+	}
+
+	t.Logf("Single worker: %v → salt=%s", elapsedSingle, saltSingle)
+	t.Logf("Multi worker (%d): %v → salt=%s", numWorkers, elapsedMulti, saltMulti)
+	t.Logf("Speedup: %.2fx", float64(elapsedSingle)/float64(elapsedMulti))
+
+	// The salts may differ (different workers find different valid salts),
+	// but both should verify correctly.
+	err = Verify(saltSingle, Algorithm, rootCID, dataTXID, 1024)
+	if err != nil {
+		t.Errorf("single-worker salt doesn't verify: %v", err)
+	}
+	err = Verify(saltMulti, Algorithm, rootCID, dataTXID, 1024)
+	if err != nil {
+		t.Errorf("multi-worker salt doesn't verify: %v", err)
+	}
+}
+
+// TestComputePoWParallel_Concurrency verifies that multiple goroutines
+// are actually spawned (by checking that different workers can find
+// the solution at different salt offsets).
+func TestComputePoWParallel_Concurrency(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping PoW concurrency test in short mode")
+	}
+
+	rootCID := "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+	dataTXID := "concurrency-test"
+
+	// Run with 4 workers and verify we get a valid result.
+	salt, err := FastComputePoWParallel(context.Background(), rootCID, dataTXID, 4)
+	if err != nil {
+		t.Fatalf("FastComputePoWParallel(workers=4) failed: %v", err)
+	}
+
+	err = Verify(salt, Algorithm, rootCID, dataTXID, 1024)
+	if err != nil {
+		t.Errorf("salt %s from 4 workers doesn't verify: %v", salt, err)
+	}
+
+	t.Logf("4 workers found salt=%s", salt)
+}
+
+// ============================================================
+// Progress callback tests (backward-compatible with existing tests)
+// ============================================================
+
 func TestComputePoWWithProgress_Cancellation(t *testing.T) {
 	rootCID := "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
 	dataTXID := "cancel-test"

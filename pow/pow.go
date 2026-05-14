@@ -3,10 +3,13 @@
 package pow
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
+	"sync/atomic"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -22,20 +25,40 @@ const (
 	MinLeadingZeroBytes = 2
 
 	PoWThreshold = 100 * 1024 * 1024
+
+	// maxSaltSafety is a safety limit to prevent infinite loops.
+	maxSaltSafety = 10_000_000
 )
 
 var (
-	ErrMissingPoW           = errors.New("PoW is required for files smaller than 100 MiB")
-	ErrInvalidPoWFormat     = errors.New("invalid PoW format: must be a decimal string")
+	ErrMissingPoW            = errors.New("PoW is required for files smaller than 100 MiB")
+	ErrInvalidPoWFormat      = errors.New("invalid PoW format: must be a decimal string")
 	ErrPoWVerificationFailed = errors.New("PoW verification failed: insufficient leading zeros")
 	ErrAlgorithmMismatch     = errors.New("PoW algorithm mismatch")
 	ErrMissingAlgorithm      = errors.New("PoW algorithm identifier is required")
+	ErrPoWCancelled          = errors.New("PoW computation cancelled")
 )
 
+// defaultWorkers returns the recommended number of parallel PoW workers.
+// Caps at 4 to stay within reasonable memory limits (~80 MB for 4 workers).
+func defaultWorkers() int {
+	n := runtime.NumCPU()
+	if n > 4 {
+		n = 4
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// NeedsPoW reports whether a file of the given size requires a PoW proof.
 func NeedsPoW(dataSize int64) bool {
 	return dataSize < PoWThreshold
 }
 
+// Verify checks whether the given PoW salt satisfies the difficulty requirement
+// for the provided rootCID + dataTXID combination.
 func Verify(pow, powAlg, rootCID, dataTXID string, dataSize int64) error {
 	if dataSize >= PoWThreshold {
 		return nil
@@ -75,7 +98,11 @@ func hasLeadingZeroBytes(data []byte, n int) bool {
 	return true
 }
 
-// ComputePoW 计算满足难度要求的 PoW salt
+// ---------------------------------------------------------------------------
+// Single-threaded (original) – kept as fallback
+// ---------------------------------------------------------------------------
+
+// ComputePoW 计算满足难度要求的 PoW salt（单线程）。
 func ComputePoW(rootCID, dataTXID string) (string, error) {
 	password := []byte(rootCID + dataTXID)
 	var salt uint64
@@ -86,16 +113,15 @@ func ComputePoW(rootCID, dataTXID string) (string, error) {
 		if hasLeadingZeroBytes(hash, MinLeadingZeroBytes) {
 			return strconv.FormatUint(salt, 10), nil
 		}
-		if salt > 10_000_000 {
+		if salt > maxSaltSafety {
 			return "", errors.New("PoW computation exceeded safety limit")
 		}
 	}
 }
 
-// FastComputePoW uses reduced memory for testing only
+// FastComputePoW uses reduced memory (1 MiB) for testing only.
 func FastComputePoW(rootCID, dataTXID string) (string, error) {
 	password := []byte(rootCID + dataTXID)
-	// Use 1MB memory for fast testing
 	memory := uint32(1024) // 1 MB
 	var salt uint64
 	for salt = 0; ; salt++ {
@@ -105,8 +131,167 @@ func FastComputePoW(rootCID, dataTXID string) (string, error) {
 		if hasLeadingZeroBytes(hash, MinLeadingZeroBytes) {
 			return strconv.FormatUint(salt, 10), nil
 		}
-		if salt > 10_000_000 {
+		if salt > maxSaltSafety {
 			return "", errors.New("PoW computation exceeded safety limit")
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Context-aware single-threaded variants (with progress callback)
+// ---------------------------------------------------------------------------
+
+// ComputePoWWithProgress is like ComputePoW but respects context cancellation
+// and invokes the progress callback with the current attempt number.
+func ComputePoWWithProgress(ctx context.Context, rootCID, dataTXID string, progress func(attempts uint64)) (string, error) {
+	password := []byte(rootCID + dataTXID)
+	var salt uint64
+	for salt = 0; ; salt++ {
+		select {
+		case <-ctx.Done():
+			return "", ErrPoWCancelled
+		default:
+		}
+
+		if progress != nil {
+			progress(salt)
+		}
+
+		saltBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(saltBytes, salt)
+		hash := argon2.IDKey(password, saltBytes, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
+		if hasLeadingZeroBytes(hash, MinLeadingZeroBytes) {
+			return strconv.FormatUint(salt, 10), nil
+		}
+		if salt > maxSaltSafety {
+			return "", errors.New("PoW computation exceeded safety limit")
+		}
+	}
+}
+
+// FastComputePoWWithProgress is like FastComputePoW but respects context
+// cancellation and invokes the progress callback with the current attempt.
+func FastComputePoWWithProgress(ctx context.Context, rootCID, dataTXID string, progress func(attempts uint64)) (string, error) {
+	password := []byte(rootCID + dataTXID)
+	memory := uint32(1024) // 1 MB
+	var salt uint64
+	for salt = 0; ; salt++ {
+		select {
+		case <-ctx.Done():
+			return "", ErrPoWCancelled
+		default:
+		}
+
+		if progress != nil {
+			progress(salt)
+		}
+
+		saltBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(saltBytes, salt)
+		hash := argon2.IDKey(password, saltBytes, 1, memory, 1, 32)
+		if hasLeadingZeroBytes(hash, MinLeadingZeroBytes) {
+			return strconv.FormatUint(salt, 10), nil
+		}
+		if salt > maxSaltSafety {
+			return "", errors.New("PoW computation exceeded safety limit")
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Multi-core parallel search
+// ---------------------------------------------------------------------------
+
+// ComputePoWParallel searches for a valid PoW salt using numWorkers parallel
+// goroutines. Each worker walks an interleaved slice of the salt space so that
+// ranges are non-overlapping and load is naturally balanced.
+//
+// Worker i starts at salt=i and increments by numWorkers each iteration.
+// The first worker to find a valid salt cancels all others via context.
+//
+// If numWorkers <= 0 the default (min(runtime.NumCPU(), 4)) is used.
+func ComputePoWParallel(ctx context.Context, rootCID, dataTXID string, numWorkers int) (string, error) {
+	return computePoWParallel(ctx, rootCID, dataTXID, numWorkers, argon2Memory)
+}
+
+// FastComputePoWParallel is the reduced-memory variant of ComputePoWParallel
+// intended for tests. It uses 1 MiB per Argon2id invocation instead of 20 MiB.
+func FastComputePoWParallel(ctx context.Context, rootCID, dataTXID string, numWorkers int) (string, error) {
+	return computePoWParallel(ctx, rootCID, dataTXID, numWorkers, 1024)
+}
+
+// computePoWParallel is the shared parallel search implementation.
+func computePoWParallel(ctx context.Context, rootCID, dataTXID string, numWorkers int, memoryKB uint32) (string, error) {
+	if numWorkers <= 0 {
+		numWorkers = defaultWorkers()
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	password := []byte(rootCID + dataTXID)
+
+	type result struct {
+		salt uint64
+		err  error
+	}
+
+	resultCh := make(chan result, 1)
+	var found atomic.Bool
+
+	for w := 0; w < numWorkers; w++ {
+		go func(start uint64) {
+			for salt := start; ; salt += uint64(numWorkers) {
+				// Bail out if the context is done (parent cancelled or we cancelled).
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				// Another worker already found the answer.
+				if found.Load() {
+					return
+				}
+
+				saltBytes := make([]byte, 8)
+				binary.LittleEndian.PutUint64(saltBytes, salt)
+				hash := argon2.IDKey(password, saltBytes, argon2Time, memoryKB, argon2Threads, argon2KeyLen)
+
+				if hasLeadingZeroBytes(hash, MinLeadingZeroBytes) {
+					// Only the first winner delivers the result.
+					if found.CompareAndSwap(false, true) {
+						select {
+						case resultCh <- result{salt: salt}:
+							cancel() // tell siblings to stop
+						default:
+						}
+					}
+					return
+				}
+
+				if salt > maxSaltSafety {
+					if found.CompareAndSwap(false, true) {
+						select {
+						case resultCh <- result{err: errors.New("PoW computation exceeded safety limit")}:
+							cancel()
+						default:
+						}
+					}
+					return
+				}
+			}
+		}(uint64(w))
+	}
+
+	// Wait for the first result or for the whole operation to be cancelled.
+	select {
+	case r := <-resultCh:
+		if r.err != nil {
+			return "", r.err
+		}
+		return strconv.FormatUint(r.salt, 10), nil
+	case <-ctx.Done():
+		return "", ErrPoWCancelled
 	}
 }

@@ -2,6 +2,7 @@
 package uploader
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -63,7 +64,7 @@ func New(cfg *Config) *Uploader {
 //  3. Compute PoW (if < 100 MiB)
 //  4. Upload CAR to Arweave
 //  5. Create and upload metadata transaction
-func (u *Uploader) UploadFile(filePath string) (*UploadResult, error) {
+func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResult, error) {
 	result := &UploadResult{
 		FilePath: filePath,
 	}
@@ -89,8 +90,8 @@ func (u *Uploader) UploadFile(filePath string) (*UploadResult, error) {
 
 	// 3. Compute PoW if needed (first pass with empty data_txid)
 	if pow.NeedsPoW(result.DataSize) {
-		fmt.Printf("   Computing PoW (Argon2id 20MB/1/1)...")
-		powSalt, err := pow.ComputePoW(result.RootCID, "")
+		fmt.Printf("   Computing PoW (Argon2id 20MB/1/1, parallel)...")
+		powSalt, err := pow.ComputePoWParallel(ctx, result.RootCID, "", 0)
 		if err != nil {
 			result.Error = fmt.Errorf("PoW computation failed: %w", err)
 			return result, result.Error
@@ -154,8 +155,8 @@ func (u *Uploader) UploadFile(filePath string) (*UploadResult, error) {
 
 	// 5. Recompute PoW with actual data_txid
 	if pow.NeedsPoW(result.DataSize) {
-		fmt.Printf("   Recomputing PoW with data_txid...")
-		powSalt, err := pow.ComputePoW(result.RootCID, result.DataTXID)
+		fmt.Printf("   Recomputing PoW with data_txid (parallel)...")
+		powSalt, err := pow.ComputePoWParallel(ctx, result.RootCID, result.DataTXID, 0)
 		if err != nil {
 			result.Error = fmt.Errorf("PoW recomputation failed: %w", err)
 			return result, result.Error
@@ -210,7 +211,7 @@ func buildSingleItemBundle(item *arweave.BundleItem) ([]byte, error) {
 }
 
 // UploadDir uploads all files in a directory.
-func (u *Uploader) UploadDir(dirPath string) ([]*UploadResult, error) {
+func (u *Uploader) UploadDir(ctx context.Context, dirPath string) ([]*UploadResult, error) {
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read directory: %w", err)
@@ -229,7 +230,7 @@ func (u *Uploader) UploadDir(dirPath string) ([]*UploadResult, error) {
 
 	var results []*UploadResult
 	for _, f := range files {
-		result, err := u.UploadFile(f)
+		result, err := u.UploadFile(ctx, f)
 		results = append(results, result)
 		if err != nil {
 			fmt.Printf("   Warning: %v\n", err)
