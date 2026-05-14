@@ -16,6 +16,40 @@ import (
 	"golang.org/x/crypto/argon2"
 )
 
+// ProgressInfo 进度信息，用于进度回调
+type ProgressInfo struct {
+	Attempts uint64  // 已尝试次数
+	Speed    float64 // 实时速度（h/s）
+	BestSalt uint64  // 当前最佳 salt
+}
+
+// ProgressCallback 进度回调函数
+type ProgressCallback func(info ProgressInfo)
+
+// FormatSpeed 格式化速度，1000 进制
+// < 1000 → "xxx h/s"
+// ≥ 1000 → "x.x K/s"
+// ≥ 1,000,000 → "x.x M/s"
+func FormatSpeed(hps float64) string {
+	switch {
+	case hps >= 1_000_000:
+		return fmt.Sprintf("%.1f M/s", hps/1_000_000)
+	case hps >= 1000:
+		return fmt.Sprintf("%.1f K/s", hps/1000)
+	default:
+		return fmt.Sprintf("%.0f h/s", hps)
+	}
+}
+
+// FormatNumber 格式化数字加逗号
+func FormatNumber(n uint64) string {
+	s := strconv.FormatUint(n, 10)
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
+}
+
 const (
 	Algorithm = "argon2id-light-v1"
 
@@ -229,6 +263,11 @@ func ComputePoWParallel(ctx context.Context, rootCID, dataTXID string, numWorker
 	return computePoWParallel(ctx, rootCID, dataTXID, numWorkers, argon2Memory)
 }
 
+// ComputePoWParallelWithProgress 带进度回调的并行 PoW 计算
+func ComputePoWParallelWithProgress(ctx context.Context, rootCID, dataTXID string, numWorkers int, progress ProgressCallback) (string, error) {
+	return computePoWParallelWithProgress(ctx, rootCID, dataTXID, numWorkers, argon2Memory, progress)
+}
+
 // FastComputePoWParallel is the reduced-memory variant of ComputePoWParallel
 // intended for tests. It uses 1 MiB per Argon2id invocation instead of 20 MiB.
 func FastComputePoWParallel(ctx context.Context, rootCID, dataTXID string, numWorkers int) (string, error) {
@@ -287,6 +326,112 @@ func computePoWParallel(ctx context.Context, rootCID, dataTXID string, numWorker
 					return
 				}
 
+				attempts++
+				if attempts > maxAttempts {
+					if found.CompareAndSwap(false, true) {
+						select {
+						case resultCh <- result{err: errors.New("PoW computation exceeded safety limit")}:
+							cancel()
+						default:
+						}
+					}
+					return
+				}
+			}
+		}(w)
+	}
+
+	select {
+	case r := <-resultCh:
+		if r.err != nil {
+			return "", r.err
+		}
+		return strconv.FormatUint(r.salt, 10), nil
+	case <-ctx.Done():
+		return "", ErrPoWCancelled
+	}
+}
+
+// computePoWParallelWithProgress 带进度回调的并行搜索实现
+func computePoWParallelWithProgress(ctx context.Context, rootCID, dataTXID string, numWorkers int, memoryKB uint32, progress ProgressCallback) (string, error) {
+	if numWorkers <= 0 {
+		numWorkers = DefaultWorkers()
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	password := []byte(rootCID + dataTXID)
+	seedBase := time.Now().UnixNano()
+
+	type result struct {
+		salt uint64
+		err  error
+	}
+
+	resultCh := make(chan result, 1)
+	var found atomic.Bool
+	var totalAttempts atomic.Uint64
+	var bestSalt atomic.Uint64
+
+	// 进度统计 goroutine
+	if progress != nil {
+		go func() {
+			var prev uint64
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					current := totalAttempts.Load()
+					speed := float64(current - prev)
+					prev = current
+					progress(ProgressInfo{
+						Attempts: current,
+						Speed:    speed,
+						BestSalt: bestSalt.Load(),
+					})
+				}
+			}
+		}()
+	}
+
+	for w := 0; w < numWorkers; w++ {
+		go func(workerID int) {
+			rng := rand.New(rand.NewSource(seedBase + int64(workerID)))
+			var attempts uint64
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				if found.Load() {
+					return
+				}
+
+				salt := rng.Uint64()
+				saltBytes := make([]byte, 8)
+				binary.LittleEndian.PutUint64(saltBytes, salt)
+				hash := argon2.IDKey(password, saltBytes, argon2Time, memoryKB, argon2Threads, argon2KeyLen)
+
+				if hasLeadingZeroBytes(hash, MinLeadingZeroBytes) {
+					if found.CompareAndSwap(false, true) {
+						totalAttempts.Add(1)
+						select {
+						case resultCh <- result{salt: salt}:
+							cancel()
+						default:
+						}
+					}
+					return
+				}
+
+				totalAttempts.Add(1)
+				bestSalt.Store(salt)
 				attempts++
 				if attempts > maxAttempts {
 					if found.CompareAndSwap(false, true) {

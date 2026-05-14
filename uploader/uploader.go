@@ -92,14 +92,22 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 	// 3. Compute PoW if needed (first pass with empty data_txid)
 	if pow.NeedsPoW(result.DataSize) {
 		powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
-		fmt.Printf("   Computing PoW (Argon2id 20MB/1/1, workers=%d)...", powWorkers)
-		powSalt, err := pow.ComputePoWParallel(ctx, result.RootCID, "", u.cfg.PoWWorkers)
+		fmt.Printf("   Computing PoW (%d workers)", powWorkers)
+
+		progress := func(info pow.ProgressInfo) {
+			if info.Attempts > 0 && info.Attempts%10000 == 0 {
+				fmt.Printf("\r   Computing PoW (%d workers): %s hashes (%s), best salt=%d",
+					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), info.BestSalt)
+			}
+		}
+
+		powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, "", u.cfg.PoWWorkers, progress)
 		if err != nil {
 			result.Error = fmt.Errorf("PoW computation failed: %w", err)
 			return result, result.Error
 		}
 		result.PoW = powSalt
-		fmt.Printf(" found salt=%s\n", powSalt)
+		fmt.Printf("\r   PoW: salt=%s                                         \n", powSalt)
 	} else {
 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
 	}
@@ -158,14 +166,20 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 	// 5. Recompute PoW with actual data_txid
 	if pow.NeedsPoW(result.DataSize) {
 		powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
-		fmt.Printf("   Recomputing PoW with data_txid (workers=%d)...", powWorkers)
-		powSalt, err := pow.ComputePoWParallel(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers)
+		fmt.Printf("   Recomputing PoW with data_txid (%d workers)", powWorkers)
+		progress2 := func(info pow.ProgressInfo) {
+			if info.Attempts > 0 && info.Attempts%10000 == 0 {
+				fmt.Printf("\r   Recomputing PoW (%d workers): %s hashes (%s), best salt=%d",
+					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), info.BestSalt)
+			}
+		}
+		powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers, progress2)
 		if err != nil {
 			result.Error = fmt.Errorf("PoW recomputation failed: %w", err)
 			return result, result.Error
 		}
 		result.PoW = powSalt
-		fmt.Printf(" salt=%s\n", powSalt)
+		fmt.Printf("\r   PoW: salt=%s                                         \n", powSalt)
 	}
 
 	// 6. Create metadata JSON
