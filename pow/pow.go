@@ -5,9 +5,11 @@ package pow
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"runtime"
 	"strconv"
 	"sync/atomic"
@@ -15,6 +17,48 @@ import (
 
 	"golang.org/x/crypto/argon2"
 )
+
+// =============================================================================
+// PoW Cache — avoid recomputing PoW for the same file
+// =============================================================================
+
+// PoWCache is stored alongside the file as {filename}.pow.json.
+type PoWCache struct {
+	RootCID  string `json:"root_cid"`
+	DataTXID string `json:"data_txid"`
+	Salt     string `json:"salt"`
+}
+
+// LoadPoWCache reads a cache file and returns the salt if rootCID and
+// dataTXID match. Returns ("", false) on any miss or error.
+func LoadPoWCache(cachePath string, rootCID, dataTXID string) (string, bool) {
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		return "", false
+	}
+	var c PoWCache
+	if err := json.Unmarshal(data, &c); err != nil {
+		return "", false
+	}
+	if c.RootCID == rootCID && c.DataTXID == dataTXID {
+		return c.Salt, true
+	}
+	return "", false
+}
+
+// SavePoWCache writes the cache to disk.
+func SavePoWCache(cachePath string, rootCID, dataTXID, salt string) error {
+	c := PoWCache{
+		RootCID:  rootCID,
+		DataTXID: dataTXID,
+		Salt:     salt,
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(cachePath, data, 0644)
+}
 
 // ProgressInfo 进度信息，用于进度回调
 type ProgressInfo struct {

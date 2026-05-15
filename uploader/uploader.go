@@ -91,56 +91,70 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 	result.RootCID = rootCID.String()
 
 	// 3. Compute PoW if needed (first pass with empty data_txid)
-	// 3. Compute PoW if needed (first pass with empty data_txid)
+	cachePath := filePath + ".pow.json"
+
 	if pow.NeedsPoW(result.DataSize) {
 		powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
-		fmt.Printf("   Computing PoW (%d workers)", powWorkers)
 
-		// 每秒显示一次进度
-		var lastPrint time.Time
-		var totalAttempts uint64
-		progress := func(info pow.ProgressInfo) {
-			totalAttempts = info.Attempts
-			now := time.Now()
-			if info.Attempts == 0 || now.Sub(lastPrint) < time.Second {
-				return
-			}
-			lastPrint = now
-			pct := float64(info.Attempts) / float64(expectedTotal) * 100
-			eta := ""
-			if info.Speed > 0 {
-				remaining := int((float64(expectedTotal) - float64(info.Attempts)) / info.Speed)
-				if remaining > 0 {
-					if remaining >= 3600 {
-						eta = fmt.Sprintf("%dh%dm", remaining/3600, (remaining%3600)/60)
-					} else if remaining >= 60 {
-						eta = fmt.Sprintf("%dm%ds", remaining/60, remaining%60)
-					} else {
-						eta = fmt.Sprintf("%ds", remaining)
+		// Check cache
+		if cachedSalt, ok := pow.LoadPoWCache(cachePath, result.RootCID, ""); ok {
+			result.PoW = cachedSalt
+			fmt.Printf("   PoW loaded from cache (%s) — salt=%s\n", cachePath, cachedSalt)
+		} else {
+			fmt.Printf("   Computing PoW (%d workers)", powWorkers)
+
+			// 每秒显示一次进度
+			var lastPrint time.Time
+			var totalAttempts uint64
+			progress := func(info pow.ProgressInfo) {
+				totalAttempts = info.Attempts
+				now := time.Now()
+				if info.Attempts == 0 || now.Sub(lastPrint) < time.Second {
+					return
+				}
+				lastPrint = now
+				pct := float64(info.Attempts) / float64(expectedTotal) * 100
+				eta := ""
+				if info.Speed > 0 {
+					remaining := int((float64(expectedTotal) - float64(info.Attempts)) / info.Speed)
+					if remaining > 0 {
+						if remaining >= 3600 {
+							eta = fmt.Sprintf("%dh%dm", remaining/3600, (remaining%3600)/60)
+						} else if remaining >= 60 {
+							eta = fmt.Sprintf("%dm%ds", remaining/60, remaining%60)
+						} else {
+							eta = fmt.Sprintf("%ds", remaining)
+						}
 					}
 				}
+				if eta != "" {
+					fmt.Printf("\r   Computing PoW (%d workers): %s hashes (%s) - %.1f%% ETA %s, best salt=%d     ",
+						powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, eta, info.BestSalt)
+				} else {
+					fmt.Printf("\r   Computing PoW (%d workers): %s hashes (%s) - %.1f%%, best salt=%d     ",
+						powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, info.BestSalt)
+				}
 			}
-			if eta != "" {
-				fmt.Printf("\r   Computing PoW (%d workers): %s hashes (%s) - %.1f%% ETA %s, best salt=%d     ",
-					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, eta, info.BestSalt)
-			} else {
-				fmt.Printf("\r   Computing PoW (%d workers): %s hashes (%s) - %.1f%%, best salt=%d     ",
-					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, info.BestSalt)
-			}
-		}
 
-		start := time.Now()
-		powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, "", u.cfg.PoWWorkers, progress)
-		elapsed := time.Since(start)
-		if err != nil {
-			result.Error = fmt.Errorf("PoW computation failed: %w", err)
-			return result, result.Error
+			start := time.Now()
+			powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, "", u.cfg.PoWWorkers, progress)
+			elapsed := time.Since(start)
+			if err != nil {
+				result.Error = fmt.Errorf("PoW computation failed: %w", err)
+				return result, result.Error
+			}
+			result.PoW = powSalt
+			fmt.Printf("\r   PoW completed: %s hashes in %.1fs — salt=%s                                         \n", pow.FormatNumber(totalAttempts), elapsed.Seconds(), powSalt)
+
+			// Save cache (first pass, data_txid is empty)
+			if saveErr := pow.SavePoWCache(cachePath, result.RootCID, "", powSalt); saveErr != nil {
+				fmt.Fprintf(os.Stderr, "   Warning: failed to save PoW cache: %v\n", saveErr)
+			}
 		}
-		result.PoW = powSalt
-		fmt.Printf("\r   PoW completed: %s hashes in %.1fs — salt=%s                                         \n", pow.FormatNumber(totalAttempts), elapsed.Seconds(), powSalt)
 	} else {
 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
 	}
+
 	// 4. Upload CAR file to Arweave
 	method := metadata.MethodRaw
 	if u.cfg.UseBundle {
@@ -195,47 +209,59 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 	// 5. Recompute PoW with actual data_txid
 	if pow.NeedsPoW(result.DataSize) {
 		powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
-		fmt.Printf("   Recomputing PoW with data_txid (%d workers)", powWorkers)
-		var lastPrint2 time.Time
-		var totalAttempts2 uint64
-		progress2 := func(info pow.ProgressInfo) {
-			totalAttempts2 = info.Attempts
-			now := time.Now()
-			if info.Attempts == 0 || now.Sub(lastPrint2) < time.Second {
-				return
-			}
-			lastPrint2 = now
-			pct := float64(info.Attempts) / float64(expectedTotal) * 100
-			eta := ""
-			if info.Speed > 0 {
-				remaining := int((float64(expectedTotal) - float64(info.Attempts)) / info.Speed)
-				if remaining > 0 {
-					if remaining >= 3600 {
-						eta = fmt.Sprintf("%dh%dm", remaining/3600, (remaining%3600)/60)
-					} else if remaining >= 60 {
-						eta = fmt.Sprintf("%dm%ds", remaining/60, remaining%60)
-					} else {
-						eta = fmt.Sprintf("%ds", remaining)
+
+		// Check cache (with full data_txid)
+		if cachedSalt, ok := pow.LoadPoWCache(cachePath, result.RootCID, result.DataTXID); ok {
+			result.PoW = cachedSalt
+			fmt.Printf("   PoW loaded from cache (%s) — salt=%s\n", cachePath, cachedSalt)
+		} else {
+			fmt.Printf("   Recomputing PoW with data_txid (%d workers)", powWorkers)
+			var lastPrint2 time.Time
+			var totalAttempts2 uint64
+			progress2 := func(info pow.ProgressInfo) {
+				totalAttempts2 = info.Attempts
+				now := time.Now()
+				if info.Attempts == 0 || now.Sub(lastPrint2) < time.Second {
+					return
+				}
+				lastPrint2 = now
+				pct := float64(info.Attempts) / float64(expectedTotal) * 100
+				eta := ""
+				if info.Speed > 0 {
+					remaining := int((float64(expectedTotal) - float64(info.Attempts)) / info.Speed)
+					if remaining > 0 {
+						if remaining >= 3600 {
+							eta = fmt.Sprintf("%dh%dm", remaining/3600, (remaining%3600)/60)
+						} else if remaining >= 60 {
+							eta = fmt.Sprintf("%dm%ds", remaining/60, remaining%60)
+						} else {
+							eta = fmt.Sprintf("%ds", remaining)
+						}
 					}
 				}
+				if eta != "" {
+					fmt.Printf("\r   Recomputing PoW (%d workers): %s hashes (%s) - %.1f%% ETA %s, best salt=%d     ",
+						powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, eta, info.BestSalt)
+				} else {
+					fmt.Printf("\r   Recomputing PoW (%d workers): %s hashes (%s) - %.1f%%, best salt=%d     ",
+						powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, info.BestSalt)
+				}
 			}
-			if eta != "" {
-				fmt.Printf("\r   Recomputing PoW (%d workers): %s hashes (%s) - %.1f%% ETA %s, best salt=%d     ",
-					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, eta, info.BestSalt)
-			} else {
-				fmt.Printf("\r   Recomputing PoW (%d workers): %s hashes (%s) - %.1f%%, best salt=%d     ",
-					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, info.BestSalt)
+			start2 := time.Now()
+			powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers, progress2)
+			elapsed2 := time.Since(start2)
+			if err != nil {
+				result.Error = fmt.Errorf("PoW recomputation failed: %w", err)
+				return result, result.Error
+			}
+			result.PoW = powSalt
+			fmt.Printf("\r   PoW completed: %s hashes in %.1fs — salt=%s                                         \n", pow.FormatNumber(totalAttempts2), elapsed2.Seconds(), powSalt)
+
+			// Save cache (second pass, with full data_txid)
+			if saveErr := pow.SavePoWCache(cachePath, result.RootCID, result.DataTXID, powSalt); saveErr != nil {
+				fmt.Fprintf(os.Stderr, "   Warning: failed to save PoW cache: %v\n", saveErr)
 			}
 		}
-		start2 := time.Now()
-		powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers, progress2)
-		elapsed2 := time.Since(start2)
-		if err != nil {
-			result.Error = fmt.Errorf("PoW recomputation failed: %w", err)
-			return result, result.Error
-		}
-		result.PoW = powSalt
-		fmt.Printf("\r   PoW completed: %s hashes in %.1fs — salt=%s                                         \n", pow.FormatNumber(totalAttempts2), elapsed2.Seconds(), powSalt)
 	}
 
 	// 6. Create metadata JSON

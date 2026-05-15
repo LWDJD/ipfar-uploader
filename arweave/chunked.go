@@ -272,6 +272,9 @@ func (gc *GatewayClient) UploadDataChunkedStreamingFile(wallet *Wallet, file *os
 
 // uploadDataChunkedInternal is the common implementation for chunked upload.
 // Either data ([]byte) or dataReader (*os.File) must be set.
+//
+// Transient gateway errors (502, 503, 504) are automatically retried up to
+// 3 times with exponential backoff (1s → 2s → 4s).
 func (gc *GatewayClient) uploadDataChunkedInternal(
 	wallet *Wallet,
 	data []byte,
@@ -286,7 +289,7 @@ func (gc *GatewayClient) uploadDataChunkedInternal(
 		dataInterface = data
 	}
 
-	// ---- 1. prepare chunks (compute Merkle tree via goar) ----
+	// Step 1 (prepare chunks) and step 2 (sign) are local — do them once.
 	goarTags := make([]goartypes.Tag, len(tags))
 	for i, t := range tags {
 		goarTags[i] = goartypes.Tag{Name: t.Name, Value: t.Value}
@@ -311,36 +314,52 @@ func (gc *GatewayClient) uploadDataChunkedInternal(
 		return nil, nil, fmt.Errorf("failed to prepare chunks: %w", err)
 	}
 
-	// ---- 2. sign with correct deep hash (SHA-384) ----
+	// Sign with correct deep hash (SHA-384)
 	if err := signTxGoar(tx, wallet); err != nil {
 		return nil, nil, fmt.Errorf("failed to sign chunked tx: %w", err)
 	}
 
-	// ---- 3. submit transaction (registers data_root on gateway) ----
-	txID, err := gc.submitChunkedTransactionGoar(tx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to submit chunked tx: %w", err)
-	}
-	tx.ID = txID
+	// Steps 3–6 are network operations — wrap with retry.
+	const maxRetries = 3
+	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
-	// ---- 4. upload chunks ----
-	if dataSize > 0 {
-		if err := gc.uploadChunksGoar(tx, data, dataReader); err != nil {
-			return nil, nil, fmt.Errorf("chunk upload: %w", err)
+	var txID string
+	var status *TransactionStatus
+
+	err = retryWithBackoff(func() error {
+		// ---- 3. submit transaction (registers data_root on gateway) ----
+		var sErr error
+		txID, sErr = gc.submitChunkedTransactionGoar(tx)
+		if sErr != nil {
+			return fmt.Errorf("failed to submit chunked tx: %w", sErr)
 		}
-	}
+		tx.ID = txID
 
-	// ---- 5. wait for confirmation ----
-	status, err := gc.WaitForConfirmation(txID, 120, 3*time.Second)
-	if err != nil {
-		return convTxGoarToLegacy(tx), nil, fmt.Errorf("submitted but unconfirmed: %w", err)
-	}
-
-	// ---- 6. verify chunk integrity ----
-	if dataSize > 0 {
-		if verr := gc.verifyAllChunks(txID, tx, dataSize); verr != nil {
-			return convTxGoarToLegacy(tx), status, fmt.Errorf("post-upload verification failed: %w", verr)
+		// ---- 4. upload chunks ----
+		if dataSize > 0 {
+			if cErr := gc.uploadChunksGoar(tx, data, dataReader); cErr != nil {
+				return fmt.Errorf("chunk upload: %w", cErr)
+			}
 		}
+
+		// ---- 5. wait for confirmation ----
+		var cErr error
+		status, cErr = gc.WaitForConfirmation(txID, 120, 3*time.Second)
+		if cErr != nil {
+			return fmt.Errorf("submitted but unconfirmed: %w", cErr)
+		}
+
+		// ---- 6. verify chunk integrity ----
+		if dataSize > 0 {
+			if verr := gc.verifyAllChunks(txID, tx, dataSize); verr != nil {
+				return fmt.Errorf("post-upload verification failed: %w", verr)
+			}
+		}
+		return nil
+	}, maxRetries, delays)
+
+	if err != nil {
+		return convTxGoarToLegacy(tx), status, err
 	}
 
 	return convTxGoarToLegacy(tx), status, nil

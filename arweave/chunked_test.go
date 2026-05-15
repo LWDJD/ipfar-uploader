@@ -59,7 +59,7 @@ func TestComputeChunksAndProofs_SingleChunk(t *testing.T) {
 	}
 
 	// Verify the proof reconstructs the root
-	if !verifyProofGoar(proofs[0], root, 1) {
+	if !verifyProofGoar(proofs[0], root, len(data)) {
 		t.Errorf("single chunk proof failed verification")
 	}
 }
@@ -77,7 +77,7 @@ func TestComputeChunksAndProofs_TwoChunks(t *testing.T) {
 	}
 
 	for i, cp := range proofs {
-		if !verifyProofGoar(cp, root, 2) {
+		if !verifyProofGoar(cp, root, len(data)) {
 			t.Errorf("proof %d failed to verify against root", i)
 		}
 	}
@@ -96,7 +96,7 @@ func TestComputeChunksAndProofs_ThreeChunks(t *testing.T) {
 	}
 
 	for i, cp := range proofs {
-		if !verifyProofGoar(cp, root, 3) {
+		if !verifyProofGoar(cp, root, len(data)) {
 			t.Errorf("proof %d (3-chunk) failed verification", i)
 		}
 	}
@@ -115,7 +115,7 @@ func TestComputeChunksAndProofs_FiveChunks(t *testing.T) {
 	}
 
 	for i, cp := range proofs {
-		if !verifyProofGoar(cp, root, 5) {
+		if !verifyProofGoar(cp, root, len(data)) {
 			t.Errorf("proof %d (5-chunk) failed verification", i)
 		}
 	}
@@ -138,7 +138,7 @@ func TestComputeChunksAndProofs_PartialLastChunk(t *testing.T) {
 	}
 
 	for i, cp := range proofs {
-		if !verifyProofGoar(cp, root, 3) {
+		if !verifyProofGoar(cp, root, len(data)) {
 			t.Errorf("proof %d (partial) failed verification", i)
 		}
 	}
@@ -192,9 +192,12 @@ func verifyProofGoar(cp chunkProof, root []byte, totalSize int) bool {
 		return false
 	}
 
-	// Also verify chunk data hash matches
+	// The data hash is in the last 64 bytes: [dataHash(32)][endOffset(32)]
+	dataHashStart := len(cp.Proof) - 64
+	expectedDataHash := cp.Proof[dataHashStart : dataHashStart+32]
+
 	actualHash := sha256.Sum256(cp.Chunk)
-	if !bytes.Equal(actualHash[:], cp.Proof[:32]) {
+	if !bytes.Equal(actualHash[:], expectedDataHash) {
 		return false
 	}
 
@@ -778,8 +781,9 @@ func TestReadFullAt_Error(t *testing.T) {
 		data[i] = byte(i % 256)
 	}
 
-	broken := &brokenReaderAt{data: data, failAtByte: ChunkSize}
-	_, err := readFullAt(broken, make([]byte, ChunkSize*2), 0)
+	// fail immediately at offset 0
+	broken := &brokenReaderAt{data: data, failAtByte: 0}
+	_, err := readFullAt(broken, make([]byte, 100), 0)
 	if err == nil {
 		t.Fatal("expected error from broken reader, got nil")
 	}
