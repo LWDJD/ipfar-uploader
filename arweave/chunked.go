@@ -10,7 +10,7 @@
 //  2. Second pass: re-read data via io.ReaderAt, upload each chunk + Merkle
 //     proof to /chunk.  Memory: 256 KiB buffer.
 //  3. Build & sign tx, POST /tx, confirm.
-//  4. Verify the first chunk via GET /raw/{txID} (Range request).
+//  4. Verify all chunks via GET /raw/{txID} (Range requests).
 //
 // Legacy inline-data path (UploadData) is auto-selected for data < 256 KiB.
 package arweave
@@ -447,60 +447,66 @@ func (gc *GatewayClient) uploadChunksStreaming(
 // Data verification
 // =============================================================================
 
-// verifyFirstChunk downloads the first chunk from the gateway and verifies
-// that its SHA-256 matches expectedLeafHash.
-//
-// Uses an HTTP Range request to avoid downloading the entire file.
-func (gc *GatewayClient) verifyFirstChunk(txID string, expectedLeafHash []byte, dataSize int64) error {
-	if len(expectedLeafHash) != 32 {
-		return fmt.Errorf("invalid expected leaf hash length: %d", len(expectedLeafHash))
+// verifyAllChunks downloads every chunk from the gateway via Range requests
+// and verifies each chunk's SHA-256 against the pre-computed Merkle leaf
+// hashes.  This detects corruption in any chunk without downloading the
+// entire file — only 256 KiB × N chunks are transferred.
+func (gc *GatewayClient) verifyAllChunks(txID string, merkleLeaves [][]byte, dataSize int64) error {
+	nChunks := len(merkleLeaves)
+	if nChunks == 0 {
+		return nil
 	}
 
-	// Determine how many bytes to fetch
-	fetchLen := ChunkSize
-	if dataSize < int64(ChunkSize) {
-		fetchLen = int(dataSize)
+	for i := 0; i < nChunks; i++ {
+		offset := int64(i) * ChunkSize
+		fetchLen := ChunkSize
+		if offset+int64(ChunkSize) > dataSize {
+			fetchLen = int(dataSize - offset)
+		}
+
+		req, err := http.NewRequest("GET", gc.GatewayURL+"/raw/"+txID, nil)
+		if err != nil {
+			return fmt.Errorf("verify chunk %d/%d: failed to create request: %w", i, nChunks, err)
+		}
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(fetchLen)-1))
+
+		resp, err := gc.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("verify chunk %d/%d: failed to download: %w", i, nChunks, err)
+		}
+
+		downloaded, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(fetchLen)))
+		resp.Body.Close()
+		if readErr != nil {
+			return fmt.Errorf("verify chunk %d/%d: failed to read response: %w", i, nChunks, readErr)
+		}
+
+		// Accept 206 Partial Content and 200 OK (some gateways ignore Range)
+		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("verify chunk %d/%d: gateway returned %d", i, nChunks, resp.StatusCode)
+		}
+
+		if len(downloaded) == 0 {
+			return fmt.Errorf("verify chunk %d/%d: downloaded chunk is empty — data may not be available yet", i, nChunks)
+		}
+
+		actualHash := sha256.Sum256(downloaded)
+		expectedHash := merkleLeaves[i]
+
+		if !bytes.Equal(actualHash[:], expectedHash) {
+			return fmt.Errorf(
+				"DATA VERIFICATION FAILED: chunk %d/%d hash mismatch.\n"+
+					"  Offset: %d\n"+
+					"  Expected: %x\n"+
+					"  Got:      %x\n"+
+					"  The uploaded data may be corrupted. Do not trust this transaction.",
+				i, nChunks, offset, expectedHash, actualHash[:],
+			)
+		}
 	}
 
-	req, err := http.NewRequest("GET", gc.GatewayURL+"/raw/"+txID, nil)
-	if err != nil {
-		return fmt.Errorf("verify: failed to create request: %w", err)
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", fetchLen-1))
-
-	resp, err := gc.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("verify: failed to download first chunk: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Accept 206 Partial Content and 200 OK (some gateways ignore Range)
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("verify: gateway returned %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	downloaded, err := io.ReadAll(io.LimitReader(resp.Body, int64(fetchLen)))
-	if err != nil {
-		return fmt.Errorf("verify: failed to read downloaded chunk: %w", err)
-	}
-
-	if len(downloaded) == 0 {
-		return fmt.Errorf("verify: downloaded chunk is empty — data may not be available yet")
-	}
-
-	actualHash := sha256.Sum256(downloaded)
-
-	if !bytes.Equal(actualHash[:], expectedLeafHash) {
-		return fmt.Errorf(
-			"DATA VERIFICATION FAILED: first chunk hash mismatch.\n"+
-				"  Expected: %x\n"+
-				"  Got:      %x\n"+
-				"  The uploaded data may be corrupted. Do not trust this transaction.",
-			expectedLeafHash, actualHash[:],
-		)
-	}
-
+	// All chunks verified successfully.
+	fmt.Printf("All %d chunks verified OK\n", nChunks)
 	return nil
 }
 
@@ -514,7 +520,7 @@ func (gc *GatewayClient) verifyFirstChunk(txID string, expectedLeafHash []byte, 
 // Pass 1:  compute Merkle tree via io.ReaderAt (only hashes in memory).
 // Pass 2:  re-read and upload each chunk + Merkle proof (256 KiB buffer).
 // Pass 3:  build, sign, submit the transaction and wait for confirmation.
-// Pass 4:  verify the first chunk against the gateway.
+// Pass 4:  verify all chunks against the gateway.
 //
 // The reader must support io.ReaderAt (e.g. *os.File, *bytes.Reader).
 func (gc *GatewayClient) UploadDataChunkedStreaming(
@@ -567,7 +573,7 @@ func (gc *GatewayClient) UploadDataChunkedStreaming(
 
 	// ---- 7. verify first chunk integrity ----
 	if nChunks > 0 && len(leafHashes) > 0 {
-		if verr := gc.verifyFirstChunk(txID, leafHashes[0], dataSize); verr != nil {
+		if verr := gc.verifyAllChunks(txID, leafHashes, dataSize); verr != nil {
 			// Do NOT silently fail — verification errors must be surfaced.
 			return tx, status, fmt.Errorf("post-upload verification failed: %w", verr)
 		}

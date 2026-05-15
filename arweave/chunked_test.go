@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -340,22 +341,30 @@ func newMockChunkedServer() *httptest.Server {
 			w.Write([]byte(`"mock-anchor"`))
 
 		case strings.HasPrefix(r.URL.Path, "/raw/") && r.Method == "GET":
-			// Serve the first chunk for verification
-			txID := strings.TrimPrefix(r.URL.Path, "/raw/")
+			// Serve data matching the test pattern (byte(i % 256)) for any byte
+			// range.  This supports multi-chunk verification.
+			dataSize := ChunkSize + 100 // matches the largest test data size
 			w.Header().Set("Content-Type", "application/octet-stream")
-			// Reconstruct the expected first chunk
-			// The test data is ChunkSize+100 bytes of i%256
-			chunkLen := ChunkSize
-			firstChunk := make([]byte, chunkLen)
-			for i := 0; i < chunkLen; i++ {
-				firstChunk[i] = byte(i % 256)
-			}
-			// Handle range request
+
+			start := int64(0)
+			end := int64(dataSize) - 1
+
 			if rng := r.Header.Get("Range"); rng != "" {
+				if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &start, &end); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if end >= int64(dataSize) {
+					end = int64(dataSize) - 1
+				}
 				w.WriteHeader(http.StatusPartialContent)
 			}
-			w.Write(firstChunk)
-			_ = txID
+
+			chunk := make([]byte, end-start+1)
+			for i := int64(0); i < int64(len(chunk)); i++ {
+				chunk[i] = byte((start + i) % 256)
+			}
+			w.Write(chunk)
 
 		case strings.HasPrefix(r.URL.Path, "/tx/") && r.Method == "GET":
 			w.WriteHeader(http.StatusOK)
@@ -708,22 +717,47 @@ func TestUploadChunksStreaming_ReadError(t *testing.T) {
 // Data corruption detection tests
 // =============================================================================
 
-func TestVerifyFirstChunk_Success(t *testing.T) {
-	// Create test data and a mock server that returns the correct first chunk
-	data := make([]byte, ChunkSize*2)
+func TestVerifyAllChunks_Success(t *testing.T) {
+	// Create multi-chunk test data and a mock server that serves correct chunks.
+	data := make([]byte, ChunkSize*3+100)
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
 
-	expectedHash := sha256.Sum256(data[:ChunkSize])
+	// Pre-compute the Merkle leaf hashes for all chunks.
+	nChunks := (len(data) + ChunkSize - 1) / ChunkSize
+	leafHashes := make([][]byte, nChunks)
+	for i := 0; i < nChunks; i++ {
+		start := i * ChunkSize
+		end := start + ChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		h := sha256.Sum256(data[start:end])
+		leafHashes[i] = make([]byte, 32)
+		copy(leafHashes[i], h[:])
+	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/raw/") {
 			w.Header().Set("Content-Type", "application/octet-stream")
-			if r.Header.Get("Range") != "" {
+
+			start := int64(0)
+			end := int64(len(data)) - 1
+
+			if rng := r.Header.Get("Range"); rng != "" {
+				fmt.Sscanf(rng, "bytes=%d-%d", &start, &end)
+				if end >= int64(len(data)) {
+					end = int64(len(data)) - 1
+				}
 				w.WriteHeader(http.StatusPartialContent)
 			}
-			w.Write(data[:ChunkSize])
+
+			chunk := make([]byte, end-start+1)
+			for i := int64(0); i < int64(len(chunk)); i++ {
+				chunk[i] = byte((start + i) % 256)
+			}
+			w.Write(chunk)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -731,30 +765,69 @@ func TestVerifyFirstChunk_Success(t *testing.T) {
 	defer server.Close()
 
 	client := NewGatewayClient(server.URL)
-	err := client.verifyFirstChunk("test-tx-id", expectedHash[:], int64(len(data)))
+	err := client.verifyAllChunks("test-tx-id", leafHashes, int64(len(data)))
 	if err != nil {
-		t.Fatalf("verifyFirstChunk should succeed: %v", err)
+		t.Fatalf("verifyAllChunks should succeed: %v", err)
 	}
 }
 
-func TestVerifyFirstChunk_Corruption(t *testing.T) {
-	// Return corrupted data → verification must fail
-	data := make([]byte, ChunkSize*2)
+func TestVerifyAllChunks_Corruption(t *testing.T) {
+	// Return corrupted data for chunk 1 → verification must fail.
+	data := make([]byte, ChunkSize*3+100)
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
 
-	expectedHash := sha256.Sum256(data[:ChunkSize])
+	nChunks := (len(data) + ChunkSize - 1) / ChunkSize
+	leafHashes := make([][]byte, nChunks)
+	for i := 0; i < nChunks; i++ {
+		start := i * ChunkSize
+		end := start + ChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		h := sha256.Sum256(data[start:end])
+		leafHashes[i] = make([]byte, 32)
+		copy(leafHashes[i], h[:])
+	}
+
+	// Corrupt chunk index to detect
+	corruptIdx := 1
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/raw/") {
-			// Return CORRUPTED data (all zeros instead of pattern)
-			corrupted := make([]byte, ChunkSize)
 			w.Header().Set("Content-Type", "application/octet-stream")
-			if r.Header.Get("Range") != "" {
+
+			start := int64(0)
+			end := int64(len(data)) - 1
+
+			if rng := r.Header.Get("Range"); rng != "" {
+				fmt.Sscanf(rng, "bytes=%d-%d", &start, &end)
+				if end >= int64(len(data)) {
+					end = int64(len(data)) - 1
+				}
 				w.WriteHeader(http.StatusPartialContent)
 			}
-			w.Write(corrupted)
+
+			chunk := make([]byte, end-start+1)
+			for i := int64(0); i < int64(len(chunk)); i++ {
+				chunk[i] = byte((start + i) % 256)
+			}
+
+			// Corrupt data if the request covers the corrupted chunk
+			corruptStart := int64(corruptIdx * ChunkSize)
+			corruptEnd := corruptStart + int64(ChunkSize) - 1
+			if start <= corruptEnd && end >= corruptStart {
+				// Flip a byte in the overlapping region
+				for i := int64(0); i < int64(len(chunk)); i++ {
+					absIdx := start + i
+					if absIdx >= corruptStart && absIdx <= corruptEnd {
+						chunk[i] ^= 0xFF
+					}
+				}
+			}
+
+			w.Write(chunk)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -762,28 +835,62 @@ func TestVerifyFirstChunk_Corruption(t *testing.T) {
 	defer server.Close()
 
 	client := NewGatewayClient(server.URL)
-	err := client.verifyFirstChunk("test-tx-id", expectedHash[:], int64(len(data)))
+	err := client.verifyAllChunks("test-tx-id", leafHashes, int64(len(data)))
 	if err == nil {
-		t.Fatal("verifyFirstChunk MUST return an error for corrupted data")
+		t.Fatal("verifyAllChunks MUST return an error for corrupted data")
 	}
 	t.Logf("Corruption correctly detected: %v", err)
 }
 
-func TestVerifyFirstChunk_EmptyResponse(t *testing.T) {
-	// Empty response body → verification must fail
-	data := make([]byte, ChunkSize)
+func TestVerifyAllChunks_EmptyResponse(t *testing.T) {
+	// Return empty body for chunk 0 → verification must fail.
+	data := make([]byte, ChunkSize*2)
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
 
-	expectedHash := sha256.Sum256(data)
+	nChunks := (len(data) + ChunkSize - 1) / ChunkSize
+	leafHashes := make([][]byte, nChunks)
+	for i := 0; i < nChunks; i++ {
+		start := i * ChunkSize
+		end := start + ChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		h := sha256.Sum256(data[start:end])
+		leafHashes[i] = make([]byte, 32)
+		copy(leafHashes[i], h[:])
+	}
+
+	// Track requests — serve empty for the first chunk request
+	var requestCount int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/raw/") {
-			// Return empty body (data not available yet)
 			w.Header().Set("Content-Type", "application/octet-stream")
-			w.WriteHeader(http.StatusOK)
-			// No body written
+
+			if atomic.AddInt32(&requestCount, 1) == 1 {
+				// First request: return empty body (data not available)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+
+			// Subsequent requests: serve correct data
+			start := int64(0)
+			end := int64(len(data)) - 1
+			if rng := r.Header.Get("Range"); rng != "" {
+				fmt.Sscanf(rng, "bytes=%d-%d", &start, &end)
+				if end >= int64(len(data)) {
+					end = int64(len(data)) - 1
+				}
+				w.WriteHeader(http.StatusPartialContent)
+			}
+
+			chunk := make([]byte, end-start+1)
+			for i := int64(0); i < int64(len(chunk)); i++ {
+				chunk[i] = byte((start + i) % 256)
+			}
+			w.Write(chunk)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -791,9 +898,9 @@ func TestVerifyFirstChunk_EmptyResponse(t *testing.T) {
 	defer server.Close()
 
 	client := NewGatewayClient(server.URL)
-	err := client.verifyFirstChunk("test-tx-id", expectedHash[:], int64(len(data)))
+	err := client.verifyAllChunks("test-tx-id", leafHashes, int64(len(data)))
 	if err == nil {
-		t.Fatal("verifyFirstChunk MUST return an error for empty response")
+		t.Fatal("verifyAllChunks MUST return an error for empty response")
 	}
 	t.Logf("Empty response correctly detected: %v", err)
 }
