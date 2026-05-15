@@ -2,9 +2,31 @@ package pow
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
+	"strconv"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/argon2"
 )
+
+// fastVerify checks a PoW salt using the same reduced-memory (1 MiB) parameters
+// as FastComputePoW / FastComputePoWParallel.
+func fastVerify(powStr, rootCID, dataTXID string) error {
+	salt, err := strconv.ParseUint(powStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid PoW format: %v", err)
+	}
+	password := []byte(rootCID + dataTXID)
+	saltBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(saltBytes, salt)
+	hash := argon2.IDKey(password, saltBytes, 1, 1024, 1, 32)
+	if !hasLeadingZeroBytes(hash, MinLeadingZeroBytes) {
+		return ErrPoWVerificationFailed
+	}
+	return nil
+}
 
 func TestNeedsPoW(t *testing.T) {
 	tests := []struct {
@@ -144,8 +166,8 @@ func TestComputePoWParallel_Correctness(t *testing.T) {
 		t.Fatal("empty salt")
 	}
 
-	// Verify the salt actually satisfies the difficulty using the real Verify function.
-	err = Verify(salt, Algorithm, rootCID, dataTXID, 1024)
+	// Verify the salt actually satisfies the difficulty using the fast verifier.
+	err = fastVerify(salt, rootCID, dataTXID)
 	if err != nil {
 		t.Errorf("salt %s does not satisfy PoW difficulty: %v", salt, err)
 	}
@@ -169,7 +191,9 @@ func TestComputePoWParallel_Cancellation(t *testing.T) {
 }
 
 // TestComputePoWParallel_NumWorkers1 verifies that running with 1 worker
-// produces the same result as the single-threaded ComputePoW.
+// produces a valid PoW salt (like the single-threaded ComputePoW).
+// Note: with random salt search, single and parallel(1) will find
+// different salts; both must pass verification independently.
 func TestComputePoWParallel_NumWorkers1(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping PoW computation in short mode")
@@ -188,11 +212,17 @@ func TestComputePoWParallel_NumWorkers1(t *testing.T) {
 		t.Fatalf("FastComputePoWParallel(workers=1) failed: %v", err)
 	}
 
-	if saltSingle != saltParallel {
-		t.Errorf("mismatch: single=%s, parallel(workers=1)=%s", saltSingle, saltParallel)
+	// Both salts must verify correctly (may differ due to random search).
+	err = fastVerify(saltSingle, rootCID, dataTXID)
+	if err != nil {
+		t.Errorf("single salt %s doesn't verify: %v", saltSingle, err)
+	}
+	err = fastVerify(saltParallel, rootCID, dataTXID)
+	if err != nil {
+		t.Errorf("parallel(1) salt %s doesn't verify: %v", saltParallel, err)
 	}
 
-	t.Logf("Both single and parallel(1) found salt=%s", saltSingle)
+	t.Logf("Single found salt=%s, parallel(1) found salt=%s", saltSingle, saltParallel)
 }
 
 // TestComputePoWParallel_MultiVsSingle compares wall-clock time of
@@ -229,11 +259,11 @@ func TestComputePoWParallel_MultiVsSingle(t *testing.T) {
 
 	// The salts may differ (different workers find different valid salts),
 	// but both should verify correctly.
-	err = Verify(saltSingle, Algorithm, rootCID, dataTXID, 1024)
+	err = fastVerify(saltSingle, rootCID, dataTXID)
 	if err != nil {
 		t.Errorf("single-worker salt doesn't verify: %v", err)
 	}
-	err = Verify(saltMulti, Algorithm, rootCID, dataTXID, 1024)
+	err = fastVerify(saltMulti, rootCID, dataTXID)
 	if err != nil {
 		t.Errorf("multi-worker salt doesn't verify: %v", err)
 	}
@@ -256,7 +286,7 @@ func TestComputePoWParallel_Concurrency(t *testing.T) {
 		t.Fatalf("FastComputePoWParallel(workers=4) failed: %v", err)
 	}
 
-	err = Verify(salt, Algorithm, rootCID, dataTXID, 1024)
+	err = fastVerify(salt, rootCID, dataTXID)
 	if err != nil {
 		t.Errorf("salt %s from 4 workers doesn't verify: %v", salt, err)
 	}

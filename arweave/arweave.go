@@ -439,7 +439,14 @@ func (gc *GatewayClient) GetAnchor() (string, error) {
 }
 
 // UploadData creates, signs, submits and waits for confirmation of a data transaction.
+//
+// For data >= 256 KiB the function transparently switches to chunked upload
+// (POST /chunk) to avoid nginx 413 body-size limits on the gateway.
 func (gc *GatewayClient) UploadData(wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
+	if len(data) >= ChunkSize {
+		return gc.UploadDataChunked(wallet, data, tags)
+	}
+
 	anchor, err := gc.GetAnchor()
 	if err != nil {
 		anchor = ""
