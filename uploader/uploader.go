@@ -98,7 +98,9 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 
 		// 每秒显示一次进度
 		var lastPrint time.Time
+		var totalAttempts uint64
 		progress := func(info pow.ProgressInfo) {
+			totalAttempts = info.Attempts
 			now := time.Now()
 			if info.Attempts == 0 || now.Sub(lastPrint) < time.Second {
 				return
@@ -127,13 +129,15 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 			}
 		}
 
+		start := time.Now()
 		powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, "", u.cfg.PoWWorkers, progress)
+		elapsed := time.Since(start)
 		if err != nil {
 			result.Error = fmt.Errorf("PoW computation failed: %w", err)
 			return result, result.Error
 		}
 		result.PoW = powSalt
-		fmt.Printf("\r   PoW: salt=%s                                         \n", powSalt)
+		fmt.Printf("\r   PoW completed: %s hashes in %.1fs — salt=%s                                         \n", pow.FormatNumber(totalAttempts), elapsed.Seconds(), powSalt)
 	} else {
 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
 	}
@@ -193,7 +197,9 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 		powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
 		fmt.Printf("   Recomputing PoW with data_txid (%d workers)", powWorkers)
 		var lastPrint2 time.Time
+		var totalAttempts2 uint64
 		progress2 := func(info pow.ProgressInfo) {
+			totalAttempts2 = info.Attempts
 			now := time.Now()
 			if info.Attempts == 0 || now.Sub(lastPrint2) < time.Second {
 				return
@@ -221,13 +227,15 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 					powWorkers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, info.BestSalt)
 			}
 		}
+		start2 := time.Now()
 		powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers, progress2)
+		elapsed2 := time.Since(start2)
 		if err != nil {
 			result.Error = fmt.Errorf("PoW recomputation failed: %w", err)
 			return result, result.Error
 		}
 		result.PoW = powSalt
-		fmt.Printf("\r   PoW: salt=%s                                         \n", powSalt)
+		fmt.Printf("\r   PoW completed: %s hashes in %.1fs — salt=%s                                         \n", pow.FormatNumber(totalAttempts2), elapsed2.Seconds(), powSalt)
 	}
 
 	// 6. Create metadata JSON
