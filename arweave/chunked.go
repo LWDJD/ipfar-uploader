@@ -1,18 +1,19 @@
 // Package arweave — chunked upload support for large data.
 //
-// Arweave v2 nodes expose POST /chunk for uploading data in 256 KiB chunks,
-// bypassing nginx 413 body size limits on POST /tx (typically ~1–2 MiB).
+// This file uses the goar library's Merkle tree and chunk management
+// (vendored from github.com/everFinance/goar, Apache 2.0 licensed).
 //
-// Flow (two-pass streaming):
-//  1. First pass:  stream data via io.ReaderAt, compute SHA-256 leaf hashes
-//     and build a Merkle tree → data_root.  Only tree nodes (32 B each) stay
-//     in memory.
-//  2. Second pass: re-read data via io.ReaderAt, upload each chunk + Merkle
-//     proof to /chunk.  Memory: 256 KiB buffer.
-//  3. Build & sign tx, POST /tx, confirm.
-//  4. Verify all chunks via GET /raw/{txID} (Range requests).
+// Upload flow:
+//   Pass 1:  Prepare chunks (compute Merkle tree) via goar's GenerateChunks
+//   Pass 2:  Build, sign (with SHA-384 deep hash), and submit the transaction.
+//            The data_root is registered at the gateway when the TX is posted.
+//   Pass 3:  Upload each chunk + Merkle proof to /chunk
+//   Pass 4:  Wait for confirmation & verify chunks
 //
-// Legacy inline-data path (UploadData) is auto-selected for data < 256 KiB.
+// Reference:
+//   - goar/types/merkle.go   — annotated Merkle tree types
+//   - goar/utils/merkle.go   — Merkle tree construction & proofs
+//   - goar/utils/transaction.go — signing (DeepHash/SHA-384)
 package arweave
 
 import (
@@ -23,285 +24,31 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
+
+	goartypes "github.com/LWDJD/ipfar-uploader/arweave/goar/types"
+	goarutils "github.com/LWDJD/ipfar-uploader/arweave/goar/utils"
 )
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-// ChunkSize is the default Arweave chunk size (256 KiB).
-const ChunkSize = 256 * 1024
+// ChunkSize is the default Arweave data chunk size (256 KiB).
+const ChunkSize = goartypes.MAX_CHUNK_SIZE
+
+// noteSize is the size of offset notes in the annotated Merkle tree (32 bytes).
+const noteSize = goartypes.NOTE_SIZE
 
 // =============================================================================
-// Merkle tree types
+// Chunk submission (goar-powered)
 // =============================================================================
 
-// chunkProof holds the Merkle proof for a single chunk (includes chunk data
-// for the legacy all-in-memory path).
-type chunkProof struct {
-	Offset int    // byte offset of this chunk in the original data
-	Chunk  []byte // raw chunk bytes (subslice of data in legacy path)
-	Proof  []byte // concatenated sibling hashes from leaf to root
-}
-
-// merkleNode is an internal node in the chunk Merkle tree.
-type merkleNode struct {
-	hash   []byte // 32 bytes
-	left   int    // index of left child (-1 if leaf)
-	right  int    // index of right child (-1 if leaf or promoted)
-}
-
-// =============================================================================
-// Legacy in-memory Merkle tree (kept for backward compat and tests)
-// =============================================================================
-
-// computeChunksAndProofs splits data into fixed-size chunks, builds a Merkle
-// tree, and returns every chunk together with its inclusion proof.
-//
-// Memory: chunk slices are subslices of data (no copy); the Merkle tree
-// temporarily allocates ~2× the number of leaf hashes (32 B each).
-func computeChunksAndProofs(data []byte) (dataRoot []byte, results []chunkProof) {
-	nChunks := (len(data) + ChunkSize - 1) / ChunkSize
-	if nChunks == 0 {
-		h := sha256.Sum256(nil)
-		return h[:], nil
-	}
-
-	// ---- 1. leaf hashes ----
-	nodes := make([]merkleNode, 0, nChunks*2)
-
-	for i := 0; i < nChunks; i++ {
-		start := i * ChunkSize
-		end := start + ChunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-		h := sha256.Sum256(data[start:end])
-		nodes = append(nodes, merkleNode{hash: h[:], left: -1, right: -1})
-	}
-
-	// ---- 2. build tree bottom-up ----
-	levelStart := 0
-	levelCount := nChunks
-	for levelCount > 1 {
-		nextLevelStart := len(nodes)
-		for i := 0; i < levelCount; i += 2 {
-			leftIdx := levelStart + i
-			if i+1 < levelCount {
-				rightIdx := levelStart + i + 1
-				combined := make([]byte, 64)
-				copy(combined[:32], nodes[leftIdx].hash)
-				copy(combined[32:], nodes[rightIdx].hash)
-				h := sha256.Sum256(combined)
-				nodes = append(nodes, merkleNode{
-					hash:  h[:],
-					left:  leftIdx,
-					right: rightIdx,
-				})
-			} else {
-				nodes = append(nodes, merkleNode{
-					hash:  nodes[leftIdx].hash,
-					left:  leftIdx,
-					right: -1,
-				})
-			}
-		}
-		levelStart = nextLevelStart
-		levelCount = (levelCount + 1) / 2
-	}
-
-	rootIdx := len(nodes) - 1
-	dataRoot = nodes[rootIdx].hash
-
-	// ---- 3. compute proof for each chunk ----
-	results = make([]chunkProof, nChunks)
-	for chunkIdx := 0; chunkIdx < nChunks; chunkIdx++ {
-		start := chunkIdx * ChunkSize
-		end := start + ChunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-
-		proof := collectProof(nodes, chunkIdx, nChunks)
-		results[chunkIdx] = chunkProof{
-			Offset: start,
-			Chunk:  data[start:end],
-			Proof:  proof,
-		}
-	}
-
-	return dataRoot, results
-}
-
-// =============================================================================
-// Streaming Merkle tree (two-pass friendly)
-// =============================================================================
-
-// computeMerkleTreeFromReader computes the Merkle tree by streaming data
-// from an io.ReaderAt.  Only tree node hashes (32 B per node) are kept in
-// memory; chunk data is discarded after hashing.
-//
-// Returns:
-//   - dataRoot:      Merkle root (32 bytes)
-//   - nodes:         full Merkle tree node slice (needed to generate proofs)
-//   - nChunks:       total number of leaf chunks
-//   - leafHashes:    SHA-256 hashes of every leaf (32 B each; used for
-//                    post-upload verification)
-func computeMerkleTreeFromReader(r io.ReaderAt, dataSize int64) (
-	dataRoot []byte,
-	nodes []merkleNode,
-	nChunks int,
-	leafHashes [][]byte,
-	err error,
-) {
-	if dataSize == 0 {
-		h := sha256.Sum256(nil)
-		return h[:], nil, 0, nil, nil
-	}
-
-	nChunks = int((dataSize + ChunkSize - 1) / ChunkSize)
-
-	// ---- 1. read each chunk and compute leaf hashes ----
-	buf := make([]byte, ChunkSize)
-	leafHashes = make([][]byte, nChunks)
-	// Pre-allocate enough capacity for the full Merkle tree.
-	// Maximum node count: leaves + sum_{k>=1} ceil(leaves/2^k) ≤ 2*leaves + 1.
-	nodes = make([]merkleNode, 0, nChunks*2+1)
-
-	for i := 0; i < nChunks; i++ {
-		offset := int64(i) * ChunkSize
-		end := offset + ChunkSize
-		if end > dataSize {
-			end = dataSize
-		}
-		chunkLen := int(end - offset)
-
-		n, readErr := readFullAt(r, buf[:chunkLen], offset)
-		if readErr != nil {
-			err = fmt.Errorf("read chunk %d at offset %d: %w", i, offset, readErr)
-			return
-		}
-		if n < chunkLen {
-			err = fmt.Errorf("short read at chunk %d: got %d bytes, want %d", i, n, chunkLen)
-			return
-		}
-
-		h := sha256.Sum256(buf[:chunkLen])
-		leafHashes[i] = make([]byte, 32)
-		copy(leafHashes[i], h[:])
-		nodes = append(nodes, merkleNode{hash: leafHashes[i], left: -1, right: -1})
-	}
-
-	// ---- 2. build tree bottom-up ----
-	dataRoot, nodes = buildMerkleTree(nodes, nChunks)
-
-	return dataRoot, nodes, nChunks, leafHashes, nil
-}
-
-// buildMerkleTree builds the internal Merkle tree levels on top of existing
-// leaf nodes.  `nodes` must already contain the nChunks leaf nodes at the
-// front.  Returns the Merkle root hash and the (possibly reallocated) node
-// slice.
-func buildMerkleTree(nodes []merkleNode, nChunks int) ([]byte, []merkleNode) {
-	levelStart := 0
-	levelCount := nChunks
-	for levelCount > 1 {
-		nextLevelStart := len(nodes)
-		for i := 0; i < levelCount; i += 2 {
-			leftIdx := levelStart + i
-			if i+1 < levelCount {
-				rightIdx := levelStart + i + 1
-				combined := make([]byte, 64)
-				copy(combined[:32], nodes[leftIdx].hash)
-				copy(combined[32:], nodes[rightIdx].hash)
-				h := sha256.Sum256(combined)
-				nodes = append(nodes, merkleNode{
-					hash:  h[:],
-					left:  leftIdx,
-					right: rightIdx,
-				})
-			} else {
-				// Odd node → promote
-				nodes = append(nodes, merkleNode{
-					hash:  nodes[leftIdx].hash,
-					left:  leftIdx,
-					right: -1,
-				})
-			}
-		}
-		levelStart = nextLevelStart
-		levelCount = (levelCount + 1) / 2
-	}
-
-	return nodes[len(nodes)-1].hash, nodes
-}
-
-// readFullAt reads exactly len(buf) bytes from r starting at offset.
-// For the last partial chunk where ReadAt returns io.EOF, the bytes
-// successfully read are returned with a nil error.
-func readFullAt(r io.ReaderAt, buf []byte, offset int64) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := r.ReadAt(buf[total:], offset+int64(total))
-		total += n
-		if err != nil {
-			if err == io.EOF {
-				return total, nil
-			}
-			return total, err
-		}
-	}
-	return total, nil
-}
-
-// collectProof walks up the Merkle tree from leafIdx and collects sibling
-// hashes at each level.  nodes is the full node slice; leafCount is the
-// original number of leaves (nChunks).
-func collectProof(nodes []merkleNode, leafIdx int, leafCount int) []byte {
-	var proof bytes.Buffer
-
-	idx := leafIdx
-	levelStart := 0
-	levelCount := leafCount
-	for levelCount > 1 {
-		siblingIdx := idx ^ 1 // flip LSB to get sibling index
-		if siblingIdx < levelCount {
-			proof.Write(nodes[levelStart+siblingIdx].hash)
-		}
-		idx = idx / 2
-		levelStart = levelStart + levelCount
-		levelCount = (levelCount + 1) / 2
-	}
-
-	return proof.Bytes()
-}
-
-// =============================================================================
-// Chunk submission
-// =============================================================================
-
-// chunkUploadRequest is the JSON body for POST /chunk.
-type chunkUploadRequest struct {
-	DataRoot string `json:"data_root"`
-	DataSize string `json:"data_size"`
-	DataPath string `json:"data_path"`
-	Offset   string `json:"offset"`
-	Chunk    string `json:"chunk"`
-}
-
-// submitChunk uploads a single chunk to the gateway.
-func (gc *GatewayClient) submitChunk(dataRoot string, dataSize int, dataPath string, offset int, chunkData []byte) error {
-	req := chunkUploadRequest{
-		DataRoot: dataRoot,
-		DataSize: strconv.Itoa(dataSize),
-		DataPath: dataPath,
-		Offset:   strconv.Itoa(offset),
-		Chunk:    base64.RawURLEncoding.EncodeToString(chunkData),
-	}
-
-	body, err := json.Marshal(req)
+// submitChunkGoar uploads a single chunk to the gateway using goar's format.
+func (gc *GatewayClient) submitChunkGoar(gcGoar *goartypes.GetChunk) error {
+	body, err := gcGoar.Marshal()
 	if err != nil {
 		return fmt.Errorf("failed to marshal chunk request: %w", err)
 	}
@@ -312,72 +59,33 @@ func (gc *GatewayClient) submitChunk(dataRoot string, dataSize int, dataPath str
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return fmt.Errorf("failed to upload chunk at offset %d: %w", offset, err)
+		return fmt.Errorf("failed to upload chunk at offset %s: %w", gcGoar.Offset, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("gateway returned %d for chunk at offset %d: %s", resp.StatusCode, offset, string(respBody))
+		return fmt.Errorf("gateway returned %d for chunk at offset %s: %s",
+			resp.StatusCode, gcGoar.Offset, string(respBody))
 	}
 
 	return nil
 }
 
 // =============================================================================
-// Chunked transaction submission
+// Chunked transaction submission (goar-powered)
 // =============================================================================
 
-// TransactionWithoutData is a transaction that omits the data field (used
-// for chunked uploads where data was already uploaded via /chunk).
-type TransactionWithoutData struct {
-	Format    int    `json:"format"`
-	ID        string `json:"id"`
-	LastTx    string `json:"last_tx"`
-	Owner     string `json:"owner"`
-	Target    string `json:"target"`
-	Quantity  string `json:"quantity"`
-	DataSize  string `json:"data_size"`
-	DataRoot  string `json:"data_root"`
-	Reward    string `json:"reward"`
-	Signature string `json:"signature"`
-	Tags      []Tag  `json:"tags"`
+// signTxGoar signs a goar Transaction using the correct Arweave v2 deep hash
+// (SHA-384, matching the Arweave spec). This is critical because our previous
+// deepHash used SHA-256 which produced wrong transaction IDs on real gateways.
+func signTxGoar(tx *goartypes.Transaction, wallet *Wallet) error {
+	return goarutils.SignTransaction(tx, wallet.PrivateKey)
 }
 
-// buildChunkedTransaction constructs an unsigned transaction for chunked data.
-func buildChunkedTransaction(owner string, dataSize int, dataRoot string, tags []Tag, reward string, lastTx string) *Transaction {
-	tx := &Transaction{
-		Format:   2,
-		Owner:    owner,
-		Target:   "",
-		Quantity: "0",
-		Data:     "", // no inline data
-		DataSize: strconv.Itoa(dataSize),
-		DataRoot: dataRoot,
-		Reward:   reward,
-		LastTx:   lastTx,
-		Tags:     tags,
-	}
-	return tx
-}
-
-// submitChunkedTransaction posts a transaction without data to /tx.
-func (gc *GatewayClient) submitChunkedTransaction(tx *Transaction) (string, error) {
-	txNoData := TransactionWithoutData{
-		Format:    tx.Format,
-		ID:        tx.ID,
-		LastTx:    tx.LastTx,
-		Owner:     tx.Owner,
-		Target:    tx.Target,
-		Quantity:  tx.Quantity,
-		DataSize:  tx.DataSize,
-		DataRoot:  tx.DataRoot,
-		Reward:    tx.Reward,
-		Signature: tx.Signature,
-		Tags:      tx.Tags,
-	}
-
-	body, err := json.Marshal(txNoData)
+// submitChunkedTransactionGoar posts a transaction without data to /tx.
+func (gc *GatewayClient) submitChunkedTransactionGoar(tx *goartypes.Transaction) (string, error) {
+	body, err := marshalTxWithoutData(tx)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal chunked tx: %w", err)
 	}
@@ -401,68 +109,78 @@ func (gc *GatewayClient) submitChunkedTransaction(tx *Transaction) (string, erro
 	return tx.ID, nil
 }
 
+// marshalTxWithoutData serializes a chunked-data Transaction.
+//
+// The "data" field MUST be present (the gateway's json_struct_to_tx expects it)
+// but set to "" for chunked transactions where the data is uploaded separately
+// via /chunk.  Omitting the key entirely causes "Invalid JSON".
+func marshalTxWithoutData(tx *goartypes.Transaction) ([]byte, error) {
+	m := map[string]interface{}{
+		"format":    tx.Format,
+		"id":        tx.ID,
+		"last_tx":   tx.LastTx,
+		"owner":     tx.Owner,
+		"target":    tx.Target,
+		"quantity":  tx.Quantity,
+		"data":      "", // REQUIRED by gateway — empty string for chunked uploads
+		"data_size": tx.DataSize,
+		"data_root": tx.DataRoot,
+		"reward":    tx.Reward,
+		"signature": tx.Signature,
+		"tags":      tx.Tags,
+	}
+	return json.Marshal(m)
+}
+
 // =============================================================================
-// Streaming chunk upload (second pass)
+// Chunk upload helpers (goar-powered)
 // =============================================================================
 
-// uploadChunksStreaming re-reads data from reader, collects Merkle proofs
-// from the pre-computed tree nodes, and uploads each chunk to /chunk.
-func (gc *GatewayClient) uploadChunksStreaming(
-	dataRoot string,
-	dataSize int,
-	reader io.ReaderAt,
-	nodes []merkleNode,
-	nChunks int,
-) error {
-	buf := make([]byte, ChunkSize)
-
+// uploadChunksGoar uploads all chunks using goar's GetChunk / GetChunkStream.
+func (gc *GatewayClient) uploadChunksGoar(tx *goartypes.Transaction, data []byte, dataReader *os.File) error {
+	nChunks := len(tx.Chunks.Chunks)
 	for i := 0; i < nChunks; i++ {
-		offset := i * ChunkSize
-		end := offset + ChunkSize
-		if end > dataSize {
-			end = dataSize
-		}
-		chunkLen := end - offset
+		var gcChunk *goartypes.GetChunk
+		var err error
 
-		n, readErr := readFullAt(reader, buf[:chunkLen], int64(offset))
-		if readErr != nil {
-			return fmt.Errorf("second pass: read chunk %d at offset %d: %w", i, offset, readErr)
-		}
-		if n < chunkLen {
-			return fmt.Errorf("second pass: short read at chunk %d: got %d, want %d", i, n, chunkLen)
+		if dataReader != nil {
+			gcChunk, err = goarutils.GetChunkStream(*tx, i, dataReader)
+		} else {
+			gcChunk, err = goarutils.GetChunk(*tx, i, data)
 		}
 
-		proof := collectProof(nodes, i, nChunks)
-		dataPath := base64.RawURLEncoding.EncodeToString(proof)
+		if err != nil {
+			return fmt.Errorf("failed to get chunk %d: %w", i, err)
+		}
 
-		if err := gc.submitChunk(dataRoot, dataSize, dataPath, offset, buf[:chunkLen]); err != nil {
+		if err := gc.submitChunkGoar(gcChunk); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
 // =============================================================================
-// Data verification
+// Data verification (same algorithm, goar-powered validation)
 // =============================================================================
 
-// verifyAllChunks downloads every chunk from the gateway via Range requests
-// and verifies each chunk's SHA-256 against the pre-computed Merkle leaf
-// hashes.  This detects corruption in any chunk without downloading the
-// entire file — only 256 KiB × N chunks are transferred.
-func (gc *GatewayClient) verifyAllChunks(txID string, merkleLeaves [][]byte, dataSize int64) error {
-	nChunks := len(merkleLeaves)
+// verifyAllChunks downloads every chunk and verifies SHA-256 against expected hashes.
+func (gc *GatewayClient) verifyAllChunks(txID string, tx *goartypes.Transaction, dataSize int64) error {
+	nChunks := len(tx.Chunks.Chunks)
 	if nChunks == 0 {
 		return nil
 	}
 
+	// Reconstruct expected hashes from tx
+	expectedHashes := make([][]byte, nChunks)
+	for i, ch := range tx.Chunks.Chunks {
+		expectedHashes[i] = ch.DataHash
+	}
+
 	for i := 0; i < nChunks; i++ {
-		offset := int64(i) * ChunkSize
-		fetchLen := ChunkSize
-		if offset+int64(ChunkSize) > dataSize {
-			fetchLen = int(dataSize - offset)
-		}
+		chunk := tx.Chunks.Chunks[i]
+		offset := int64(chunk.MinByteRange)
+		fetchLen := chunk.MaxByteRange - chunk.MinByteRange
 
 		req, err := http.NewRequest("GET", gc.GatewayURL+"/raw/"+txID, nil)
 		if err != nil {
@@ -481,7 +199,6 @@ func (gc *GatewayClient) verifyAllChunks(txID string, merkleLeaves [][]byte, dat
 			return fmt.Errorf("verify chunk %d/%d: failed to read response: %w", i, nChunks, readErr)
 		}
 
-		// Accept 206 Partial Content and 200 OK (some gateways ignore Range)
 		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("verify chunk %d/%d: gateway returned %d", i, nChunks, resp.StatusCode)
 		}
@@ -491,7 +208,7 @@ func (gc *GatewayClient) verifyAllChunks(txID string, merkleLeaves [][]byte, dat
 		}
 
 		actualHash := sha256.Sum256(downloaded)
-		expectedHash := merkleLeaves[i]
+		expectedHash := expectedHashes[i]
 
 		if !bytes.Equal(actualHash[:], expectedHash) {
 			return fmt.Errorf(
@@ -505,43 +222,80 @@ func (gc *GatewayClient) verifyAllChunks(txID string, merkleLeaves [][]byte, dat
 		}
 	}
 
-	// All chunks verified successfully.
 	fmt.Printf("All %d chunks verified OK\n", nChunks)
 	return nil
 }
 
 // =============================================================================
-// Public API — streaming (primary)
+// Public API — goar-powered chunked upload
 // =============================================================================
 
-// UploadDataChunkedStreaming uploads data to Arweave using the chunked
-// /chunk endpoint with two-pass streaming.
+// buildGoarTransaction creates a goar Transaction from wallet + data info.
 //
-// Pass 1:  compute Merkle tree via io.ReaderAt (only hashes in memory).
-// Pass 2:  re-read and upload each chunk + Merkle proof (256 KiB buffer).
-// Pass 3:  build, sign, submit the transaction and wait for confirmation.
-// Pass 4:  verify all chunks against the gateway.
+// Tag names and values are base64url-encoded here because the goar
+// signing path (GetSignatureData → DeepHash → deepHashStr) expects
+// base64-encoded strings (it decodes them internally).  Raw strings
+// would fail base64 decoding and produce wrong signatures.
+func buildGoarTransaction(owner string, dataSize int64, tags []Tag, reward string, lastTx string) *goartypes.Transaction {
+	goarTags := make([]goartypes.Tag, len(tags))
+	for i, t := range tags {
+		goarTags[i] = goartypes.Tag{
+			Name:  base64.RawURLEncoding.EncodeToString([]byte(t.Name)),
+			Value: base64.RawURLEncoding.EncodeToString([]byte(t.Value)),
+		}
+	}
+
+	return &goartypes.Transaction{
+		Format:   2,
+		Owner:    owner,
+		Target:   "",
+		Quantity: "0",
+		Data:     "", // no inline data for chunked
+		DataSize: strconv.FormatInt(dataSize, 10),
+		Reward:   reward,
+		LastTx:   lastTx,
+		Tags:     goarTags,
+	}
+}
+
+// UploadDataChunked uploads data to Arweave using the chunked /chunk endpoint.
+// It uses goar's Merkle tree, deep hash signing, and chunk management.
+func (gc *GatewayClient) UploadDataChunked(wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
+	return gc.uploadDataChunkedInternal(wallet, data, nil, int64(len(data)), tags)
+}
+
+// UploadDataChunkedStreaming uploads data from an os.File (streaming).
+// Prefer this for large files to avoid loading the entire file into memory.
+func (gc *GatewayClient) UploadDataChunkedStreamingFile(wallet *Wallet, file *os.File, dataSize int64, tags []Tag) (*Transaction, *TransactionStatus, error) {
+	return gc.uploadDataChunkedInternal(wallet, nil, file, dataSize, tags)
+}
+
+// uploadDataChunkedInternal is the common implementation for chunked upload.
+// Either data ([]byte) or dataReader (*os.File) must be set.
 //
-// The reader must support io.ReaderAt (e.g. *os.File, *bytes.Reader).
-func (gc *GatewayClient) UploadDataChunkedStreaming(
+// Transient gateway errors (502, 503, 504) are automatically retried up to
+// 3 times with exponential backoff (1s → 2s → 4s).
+func (gc *GatewayClient) uploadDataChunkedInternal(
 	wallet *Wallet,
-	reader io.ReaderAt,
+	data []byte,
+	dataReader *os.File,
 	dataSize int64,
 	tags []Tag,
 ) (*Transaction, *TransactionStatus, error) {
-	// ---- 1. first pass: compute Merkle tree ----
-	dataRootHash, nodes, nChunks, leafHashes, err := computeMerkleTreeFromReader(reader, dataSize)
-	if err != nil {
-		return nil, nil, fmt.Errorf("first pass (Merkle tree): %w", err)
-	}
-	dataRoot := base64.RawURLEncoding.EncodeToString(dataRootHash)
-
-	// ---- 2. second pass: upload chunks ----
-	if err := gc.uploadChunksStreaming(dataRoot, int(dataSize), reader, nodes, nChunks); err != nil {
-		return nil, nil, fmt.Errorf("second pass (chunk upload): %w", err)
+	var dataInterface interface{}
+	if dataReader != nil {
+		dataInterface = dataReader
+	} else {
+		dataInterface = data
 	}
 
-	// ---- 3. fetch anchor & reward ----
+	// Step 1 (prepare chunks) and step 2 (sign) are local — do them once.
+	goarTags := make([]goartypes.Tag, len(tags))
+	for i, t := range tags {
+		goarTags[i] = goartypes.Tag{Name: t.Name, Value: t.Value}
+	}
+
+	// Fetch anchor & reward
 	anchor, err := gc.GetAnchor()
 	if err != nil {
 		anchor = ""
@@ -552,47 +306,253 @@ func (gc *GatewayClient) UploadDataChunkedStreaming(
 		reward = "0"
 	}
 
-	// ---- 4. build & sign transaction ----
-	tx := buildChunkedTransaction(wallet.Owner, int(dataSize), dataRoot, tags, reward, anchor)
-	if err := tx.Sign(wallet.PrivateKey); err != nil {
+	// Build goar transaction
+	tx := buildGoarTransaction(wallet.Owner, dataSize, tags, reward, anchor)
+
+	// Prepare chunks (fills tx.Chunks, tx.DataRoot)
+	if err := goarutils.PrepareChunks(tx, dataInterface, int(dataSize)); err != nil {
+		return nil, nil, fmt.Errorf("failed to prepare chunks: %w", err)
+	}
+
+	// Sign with correct deep hash (SHA-384)
+	if err := signTxGoar(tx, wallet); err != nil {
 		return nil, nil, fmt.Errorf("failed to sign chunked tx: %w", err)
 	}
 
-	// ---- 5. submit transaction ----
-	txID, err := gc.submitChunkedTransaction(tx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to submit chunked tx: %w", err)
-	}
-	tx.ID = txID
+	// Steps 3–6 are network operations — wrap with retry.
+	const maxRetries = 3
+	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
-	// ---- 6. wait for confirmation ----
-	status, err := gc.WaitForConfirmation(txID, 120, 3*time.Second)
-	if err != nil {
-		return tx, nil, fmt.Errorf("submitted but unconfirmed: %w", err)
-	}
+	var txID string
+	var status *TransactionStatus
 
-	// ---- 7. verify first chunk integrity ----
-	if nChunks > 0 && len(leafHashes) > 0 {
-		if verr := gc.verifyAllChunks(txID, leafHashes, dataSize); verr != nil {
-			// Do NOT silently fail — verification errors must be surfaced.
-			return tx, status, fmt.Errorf("post-upload verification failed: %w", verr)
+	err = retryWithBackoff(func() error {
+		// ---- 3. submit transaction (registers data_root on gateway) ----
+		var sErr error
+		txID, sErr = gc.submitChunkedTransactionGoar(tx)
+		if sErr != nil {
+			return fmt.Errorf("failed to submit chunked tx: %w", sErr)
 		}
+		tx.ID = txID
+
+		// ---- 4. upload chunks ----
+		if dataSize > 0 {
+			if cErr := gc.uploadChunksGoar(tx, data, dataReader); cErr != nil {
+				return fmt.Errorf("chunk upload: %w", cErr)
+			}
+		}
+
+		// ---- 5. wait for confirmation ----
+		var cErr error
+		status, cErr = gc.WaitForConfirmation(txID, 120, 3*time.Second)
+		if cErr != nil {
+			return fmt.Errorf("submitted but unconfirmed: %w", cErr)
+		}
+
+		// ---- 6. verify chunk integrity ----
+		if dataSize > 0 {
+			if verr := gc.verifyAllChunks(txID, tx, dataSize); verr != nil {
+				return fmt.Errorf("post-upload verification failed: %w", verr)
+			}
+		}
+		return nil
+	}, maxRetries, delays)
+
+	if err != nil {
+		return convTxGoarToLegacy(tx), status, err
 	}
 
-	return tx, status, nil
+	return convTxGoarToLegacy(tx), status, nil
 }
 
 // =============================================================================
-// Public API — backward compatible (all-in-memory)
+// Conversion helpers (goar types ↔ legacy types)
 // =============================================================================
 
-// UploadDataChunked uploads data to Arweave using the chunked /chunk endpoint.
-// It always uses the chunked flow regardless of data size.  For datasets
-// smaller than 256 KiB, UploadData (which auto-detects size) is more efficient.
+// convTxGoarToLegacy converts a goar Transaction to our legacy Transaction type.
+func convTxGoarToLegacy(gtx *goartypes.Transaction) *Transaction {
+	tags := make([]Tag, len(gtx.Tags))
+	for i, t := range gtx.Tags {
+		tags[i] = Tag{Name: t.Name, Value: t.Value}
+	}
+
+	return &Transaction{
+		Format:    gtx.Format,
+		ID:        gtx.ID,
+		LastTx:    gtx.LastTx,
+		Owner:     gtx.Owner,
+		Target:    gtx.Target,
+		Quantity:  gtx.Quantity,
+		Data:      gtx.Data,
+		DataSize:  gtx.DataSize,
+		DataRoot:  gtx.DataRoot,
+		Reward:    gtx.Reward,
+		Signature: gtx.Signature,
+		Tags:      tags,
+	}
+}
+
+// =============================================================================
+// Legacy compatibility: UploadDataChunkedStreaming with io.ReaderAt
+// =============================================================================
+
+// UploadDataChunkedStreaming uploads data via io.ReaderAt (legacy API).
+// For new code, prefer UploadDataChunkedStreamingFile with *os.File.
 //
-// This is a convenience wrapper around UploadDataChunkedStreaming that accepts
-// a []byte.  For large data, prefer UploadDataChunkedStreaming with an
-// io.ReaderAt to avoid keeping the full payload in memory.
-func (gc *GatewayClient) UploadDataChunked(wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
-	return gc.UploadDataChunkedStreaming(wallet, bytes.NewReader(data), int64(len(data)), tags)
+// This implementation copies data to a temp file to bridge between io.ReaderAt
+// and goar's *os.File API. For very large data, use UploadDataChunkedStreamingFile
+// directly with an *os.File to avoid the copy.
+func (gc *GatewayClient) UploadDataChunkedStreaming(
+	wallet *Wallet,
+	reader io.ReaderAt,
+	dataSize int64,
+	tags []Tag,
+) (*Transaction, *TransactionStatus, error) {
+	// For small-to-medium data, just read into memory and use UploadDataChunked
+	if dataSize <= 256*1024*1024 { // 256 MiB threshold
+		data := make([]byte, dataSize)
+		n, err := readFullAt(reader, data, 0)
+		if err != nil && err != io.EOF {
+			return nil, nil, fmt.Errorf("failed to read data: %w", err)
+		}
+		if int64(n) < dataSize {
+			return nil, nil, fmt.Errorf("short read: got %d bytes, expected %d", n, dataSize)
+		}
+		return gc.UploadDataChunked(wallet, data, tags)
+	}
+
+	// For very large data, create a temp file and use the streaming API
+	tmpFile, err := os.CreateTemp("", "ipfar-upload-*.bin")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	// Copy from reader to temp file in chunks
+	buf := make([]byte, goartypes.MAX_CHUNK_SIZE)
+	var totalRead int64
+	for totalRead < dataSize {
+		toRead := int64(len(buf))
+		if remaining := dataSize - totalRead; remaining < toRead {
+			toRead = remaining
+		}
+		n, err := readFullAt(reader, buf[:toRead], totalRead)
+		if n > 0 {
+			if _, werr := tmpFile.Write(buf[:n]); werr != nil {
+				return nil, nil, fmt.Errorf("failed to write temp file: %w", werr)
+			}
+			totalRead += int64(n)
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, nil, fmt.Errorf("failed to read at offset %d: %w", totalRead, err)
+		}
+	}
+
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		return nil, nil, fmt.Errorf("failed to seek temp file: %w", err)
+	}
+
+	return gc.UploadDataChunkedStreamingFile(wallet, tmpFile, dataSize, tags)
+}
+
+// readFullAt reads exactly len(buf) bytes from r starting at offset.
+// Returns the number of bytes read and any error.
+func readFullAt(r io.ReaderAt, buf []byte, offset int64) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := r.ReadAt(buf[total:], offset+int64(total))
+		total += n
+		if err != nil {
+			if err == io.EOF {
+				return total, nil
+			}
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+// =============================================================================
+// Legacy Merkle tree functions (deprecated, kept for test compatibility)
+// =============================================================================
+
+// chunkProof is the legacy proof type, kept for test backward compatibility.
+type chunkProof struct {
+	Offset int
+	Chunk  []byte
+	Proof  []byte
+}
+
+// computeChunksAndProofs is the legacy Merkle tree function using goar.
+// Kept for backward compatibility with existing tests.
+func computeChunksAndProofs(data []byte) (dataRoot []byte, results []chunkProof) {
+	tx := &goartypes.Transaction{
+		Format:   2,
+		DataSize: strconv.Itoa(len(data)),
+	}
+
+	if err := goarutils.PrepareChunks(tx, data, len(data)); err != nil {
+		// Fallback: empty root
+		return nil, nil
+	}
+
+	dataRoot = tx.Chunks.DataRoot
+
+	if tx.Chunks == nil || len(tx.Chunks.Proofs) == 0 {
+		return dataRoot, nil
+	}
+
+	results = make([]chunkProof, len(tx.Chunks.Proofs))
+	for i, proof := range tx.Chunks.Proofs {
+		ch := tx.Chunks.Chunks[i]
+		results[i] = chunkProof{
+			Offset: ch.MinByteRange,
+			Chunk:  data[ch.MinByteRange:ch.MaxByteRange],
+			Proof:  proof.Proof,
+		}
+	}
+
+	return dataRoot, results
+}
+
+// chunkLeafHash is the legacy leaf hash function (kept for test helpers).
+func chunkLeafHash(dataHash []byte, endOffset uint64) []byte {
+	return goarutils.Hash([][]byte{
+		goarutils.Hash([][]byte{dataHash}),
+		goarutils.Hash([][]byte{intToBuffer(int(endOffset))}),
+	})
+}
+
+// chunkBranchHash is the legacy branch hash function (kept for test helpers).
+func chunkBranchHash(leftID, rightID []byte, leftMax uint64) []byte {
+	return goarutils.Hash([][]byte{
+		goarutils.Hash([][]byte{leftID}),
+		goarutils.Hash([][]byte{rightID}),
+		goarutils.Hash([][]byte{intToBuffer(int(leftMax))}),
+	})
+}
+
+// intToBuffer converts int to 32-byte big-endian buffer.
+func intToBuffer(note int) []byte {
+	buffer := make([]byte, goartypes.NOTE_SIZE)
+	for i := len(buffer) - 1; i >= 0; i-- {
+		byt := note % 256
+		buffer[i] = byte(byt)
+		note = (note - byt) / 256
+	}
+	return buffer
+}
+
+// base64URLEncode is a local helper to avoid import conflicts.
+func base64URLEncode(data []byte) string {
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+// base64URLDecode is a local helper to avoid import conflicts.
+func base64URLDecode(s string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(s)
 }

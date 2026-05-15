@@ -22,6 +22,45 @@ import (
 )
 
 // =============================================================================
+// Retry helpers
+// =============================================================================
+
+// isRetryableHTTPError checks whether an error is a transient gateway error
+// (HTTP 502, 503, or 504) that should be retried.
+func isRetryableHTTPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "gateway returned 502") ||
+		strings.Contains(s, "gateway returned 503") ||
+		strings.Contains(s, "gateway returned 504")
+}
+
+// retryWithBackoff executes fn up to maxRetries+1 times if the error is
+// retryable. Between retries it sleeps for delays[attempt] and prints a
+// message to stderr.
+func retryWithBackoff(fn func() error, maxRetries int, delays []time.Duration) error {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableHTTPError(err) {
+			return err
+		}
+		if attempt < maxRetries {
+			delay := delays[attempt]
+			fmt.Fprintf(os.Stderr, "Retry %d/%d in %ds...\n", attempt+1, maxRetries, int(delay.Seconds()))
+			time.Sleep(delay)
+		}
+	}
+	return lastErr
+}
+
+// =============================================================================
 // Wallet
 // =============================================================================
 
@@ -442,43 +481,59 @@ func (gc *GatewayClient) GetAnchor() (string, error) {
 //
 // For data >= 256 KiB the function transparently switches to chunked upload
 // (POST /chunk) to avoid nginx 413 body-size limits on the gateway.
+//
+// Transient gateway errors (502, 503, 504) are automatically retried up to
+// 3 times with exponential backoff (1s → 2s → 4s).
 func (gc *GatewayClient) UploadData(wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
 	if len(data) >= ChunkSize {
 		return gc.UploadDataChunked(wallet, data, tags)
 	}
 
-	anchor, err := gc.GetAnchor()
+	var tx *Transaction
+	var status *TransactionStatus
+
+	const maxRetries = 3
+	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+
+	err := retryWithBackoff(func() error {
+		anchor, aErr := gc.GetAnchor()
+		if aErr != nil {
+			anchor = ""
+		}
+
+		reward, rErr := gc.GetReward(int64(len(data)))
+		if rErr != nil {
+			reward = "0"
+		}
+
+		tb := NewTransactionBuilder(wallet.Owner)
+		tb.SetData(data)
+		tb.SetTags(tags)
+		tb.SetLastTx(anchor)
+		tb.SetReward(reward)
+
+		tx = tb.Build()
+		if sErr := tx.Sign(wallet.PrivateKey); sErr != nil {
+			return fmt.Errorf("failed to sign: %w", sErr)
+		}
+
+		txID, sErr := gc.SubmitTransaction(tx)
+		if sErr != nil {
+			return fmt.Errorf("failed to submit: %w", sErr)
+		}
+		tx.ID = txID
+
+		var cErr error
+		status, cErr = gc.WaitForConfirmation(txID, 120, 3*time.Second)
+		if cErr != nil {
+			return fmt.Errorf("submitted but unconfirmed: %w", cErr)
+		}
+		return nil
+	}, maxRetries, delays)
+
 	if err != nil {
-		anchor = ""
+		return tx, status, err
 	}
-
-	reward, err := gc.GetReward(int64(len(data)))
-	if err != nil {
-		reward = "0"
-	}
-
-	tb := NewTransactionBuilder(wallet.Owner)
-	tb.SetData(data)
-	tb.SetTags(tags)
-	tb.SetLastTx(anchor)
-	tb.SetReward(reward)
-
-	tx := tb.Build()
-	if err := tx.Sign(wallet.PrivateKey); err != nil {
-		return nil, nil, fmt.Errorf("failed to sign: %w", err)
-	}
-
-	txID, err := gc.SubmitTransaction(tx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to submit: %w", err)
-	}
-	tx.ID = txID
-
-	status, err := gc.WaitForConfirmation(txID, 120, 3*time.Second)
-	if err != nil {
-		return tx, nil, fmt.Errorf("submitted but unconfirmed: %w", err)
-	}
-
 	return tx, status, nil
 }
 
