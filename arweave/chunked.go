@@ -3,23 +3,55 @@
 // Arweave v2 nodes expose POST /chunk for uploading data in 256 KiB chunks,
 // bypassing nginx 413 body size limits on POST /tx (typically ~1–2 MiB).
 //
-// Flow (two-pass streaming):
-//  1. First pass:  stream data via io.ReaderAt, compute SHA-256 leaf hashes
-//     and build a Merkle tree → data_root.  Only tree nodes (32 B each) stay
-//     in memory.
-//  2. Build, sign, and POST /tx to register data_root on the node.
-//  3. Second pass: re-read data via io.ReaderAt, upload each chunk + Merkle
-//     proof to /chunk.  Memory: 256 KiB buffer.
-//  4. Wait for transaction confirmation.
-//  5. Verify all chunks via GET /raw/{txID} (Range requests).
+// Merkle tree algorithm
+// =====================
+// This file implements the exact annotated Merkle tree from Erlang's
+// ar_merkle.erl (generate_tree / generate_path / validate_path).  The key
+// difference from a standard Merkle tree is that every node carries an
+// offset "note" that records the cumulative byte range covered by its
+// subtree.  This allows the gateway to verify not only that a chunk hash is
+// included in the tree but also that the chunk's size and position agree
+// with the transaction's data_size.
 //
-// Legacy inline-data path (UploadData) is auto-selected for data < 256 KiB.
+// Leaf:
+//   leaf_id = SHA-256( SHA-256(chunk_data) || SHA-256(end_offset_32be) )
+//
+// Branch (internal node):
+//   branch_id = SHA-256( SHA-256(left_id) || SHA-256(right_id) ||
+//                        SHA-256(left_max_offset_32be) )
+//
+// Data path (Merkle proof) binary format, bottom-up:
+//   leaf    → [dataHash (32 B)] [endOffset (32 B)]                          = 64 B
+//   branch  → [leftChild.id (32 B)] [rightChild.id (32 B)] [note (32 B)] | rest
+//                                                                            = 96 B per level
+//   total   = 64 + 96 × (tree_height - 1)
+//
+// Upload order
+// ============
+// The Arweave gateway requires that the data_root be registered BEFORE any
+// chunks are uploaded.  A data_root is registered when:
+//   1. A transaction carrying data_root is submitted via POST /tx, OR
+//   2. A data_root is synchronised from a mined block via POST /data_roots.
+//
+// Therefore the two-pass streaming flow is:
+//   Pass 1:  compute Merkle tree → data_root
+//   Pass 2:  build, sign, submit transaction (registers data_root)
+//   Pass 3:  upload chunks with Merkle proofs to /chunk
+//   Pass 4:  wait for confirmation & verify chunks
+//
+// Reference
+// =========
+//   - apps/arweave/src/ar_merkle.erl   — Merkle tree construction & validation
+//   - apps/arweave/src/ar_tx.erl       — chunk splitting & chunk ID generation
+//   - apps/arweave/src/ar_poa.erl      — validate_data_path/5
+//   - arweave-js lib/merkle.js         — JavaScript reference implementation
 package arweave
 
 import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,124 +64,83 @@ import (
 // Constants
 // =============================================================================
 
-// ChunkSize is the default Arweave chunk size (256 KiB).
+// ChunkSize is the default Arweave data chunk size (256 KiB).
 const ChunkSize = 256 * 1024
+
+// noteSize is the size of offset notes in the annotated Merkle tree (32 bytes,
+// big-endian 256-bit integer as per ar.hrl NOTE_SIZE).
+const noteSize = 32
+
+// =============================================================================
+// Annotated Merkle tree hash functions (matches ar_merkle.erl)
+// =============================================================================
+
+// chunkLeafHash computes the ID of a Merkle leaf node.
+//
+//	leaf = SHA-256( SHA-256(dataHash) || SHA-256(offsetBigEndian32) )
+//
+// dataHash is SHA-256 of the raw chunk bytes.  endOffset is the cumulative
+// byte count covered by this chunk (i.e. the chunk's end position).
+func chunkLeafHash(dataHash []byte, endOffset uint64) []byte {
+	hData := sha256.Sum256(dataHash) // double-SHA of chunk
+
+	noteBuf := make([]byte, noteSize)
+	binary.BigEndian.PutUint64(noteBuf[noteSize-8:], endOffset)
+	hNote := sha256.Sum256(noteBuf)
+
+	h := sha256.New()
+	h.Write(hData[:])
+	h.Write(hNote[:])
+	return h.Sum(nil)
+}
+
+// chunkBranchHash computes the ID of a Merkle branch (internal) node.
+//
+//	branch = SHA-256( SHA-256(leftID) || SHA-256(rightID) ||
+//	                  SHA-256(leftMaxBigEndian32) )
+//
+// leftMax is the maximum end offset covered by the left child's subtree.
+func chunkBranchHash(leftID, rightID []byte, leftMax uint64) []byte {
+	hLeft := sha256.Sum256(leftID)
+	hRight := sha256.Sum256(rightID)
+
+	noteBuf := make([]byte, noteSize)
+	binary.BigEndian.PutUint64(noteBuf[noteSize-8:], leftMax)
+	hNote := sha256.Sum256(noteBuf)
+
+	h := sha256.New()
+	h.Write(hLeft[:])
+	h.Write(hRight[:])
+	h.Write(hNote[:])
+	return h.Sum(nil)
+}
 
 // =============================================================================
 // Merkle tree types
 // =============================================================================
 
-// chunkProof holds the Merkle proof for a single chunk (includes chunk data
-// for the legacy all-in-memory path).
-type chunkProof struct {
-	Offset int    // byte offset of this chunk in the original data
-	Chunk  []byte // raw chunk bytes (subslice of data in legacy path)
-	Proof  []byte // concatenated sibling hashes from leaf to root
-}
-
-// merkleNode is an internal node in the chunk Merkle tree.
+// merkleNode is an internal or leaf node in the chunk Merkle tree.  The
+// "max" field stores the maximum end offset in this node's subtree — essential
+// for computing branch hashes and building correct data_path proofs.
 type merkleNode struct {
-	hash   []byte // 32 bytes
-	left   int    // index of left child (-1 if leaf)
-	right  int    // index of right child (-1 if leaf or promoted)
-}
-
-// =============================================================================
-// Legacy in-memory Merkle tree (kept for backward compat and tests)
-// =============================================================================
-
-// computeChunksAndProofs splits data into fixed-size chunks, builds a Merkle
-// tree, and returns every chunk together with its inclusion proof.
-//
-// Memory: chunk slices are subslices of data (no copy); the Merkle tree
-// temporarily allocates ~2× the number of leaf hashes (32 B each).
-func computeChunksAndProofs(data []byte) (dataRoot []byte, results []chunkProof) {
-	nChunks := (len(data) + ChunkSize - 1) / ChunkSize
-	if nChunks == 0 {
-		h := sha256.Sum256(nil)
-		return h[:], nil
-	}
-
-	// ---- 1. leaf hashes ----
-	nodes := make([]merkleNode, 0, nChunks*2)
-
-	for i := 0; i < nChunks; i++ {
-		start := i * ChunkSize
-		end := start + ChunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-		h := sha256.Sum256(data[start:end])
-		nodes = append(nodes, merkleNode{hash: h[:], left: -1, right: -1})
-	}
-
-	// ---- 2. build tree bottom-up ----
-	levelStart := 0
-	levelCount := nChunks
-	for levelCount > 1 {
-		nextLevelStart := len(nodes)
-		for i := 0; i < levelCount; i += 2 {
-			leftIdx := levelStart + i
-			if i+1 < levelCount {
-				rightIdx := levelStart + i + 1
-				combined := make([]byte, 64)
-				copy(combined[:32], nodes[leftIdx].hash)
-				copy(combined[32:], nodes[rightIdx].hash)
-				h := sha256.Sum256(combined)
-				nodes = append(nodes, merkleNode{
-					hash:  h[:],
-					left:  leftIdx,
-					right: rightIdx,
-				})
-			} else {
-				nodes = append(nodes, merkleNode{
-					hash:  nodes[leftIdx].hash,
-					left:  leftIdx,
-					right: -1,
-				})
-			}
-		}
-		levelStart = nextLevelStart
-		levelCount = (levelCount + 1) / 2
-	}
-
-	rootIdx := len(nodes) - 1
-	dataRoot = nodes[rootIdx].hash
-
-	// ---- 3. compute proof for each chunk ----
-	results = make([]chunkProof, nChunks)
-	for chunkIdx := 0; chunkIdx < nChunks; chunkIdx++ {
-		start := chunkIdx * ChunkSize
-		end := start + ChunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-
-		proof := collectProof(nodes, chunkIdx, nChunks)
-		results[chunkIdx] = chunkProof{
-			Offset: start,
-			Chunk:  data[start:end],
-			Proof:  proof,
-		}
-	}
-
-	return dataRoot, results
+	hash []byte // 32-byte node ID
+	max  uint64 // maximum cumulative end offset in subtree
 }
 
 // =============================================================================
 // Streaming Merkle tree (two-pass friendly)
 // =============================================================================
 
-// computeMerkleTreeFromReader computes the Merkle tree by streaming data
-// from an io.ReaderAt.  Only tree node hashes (32 B per node) are kept in
-// memory; chunk data is discarded after hashing.
+// computeMerkleTreeFromReader computes the annotated Merkle tree by streaming
+// data from an io.ReaderAt.  Only tree node data (~32 B per node) is kept in
+// memory; chunk contents are discarded after hashing.
 //
 // Returns:
-//   - dataRoot:      Merkle root (32 bytes)
-//   - nodes:         full Merkle tree node slice (needed to generate proofs)
-//   - nChunks:       total number of leaf chunks
-//   - leafHashes:    SHA-256 hashes of every leaf (32 B each; used for
-//                    post-upload verification)
+//   - dataRoot:    Merkle root (32 bytes)
+//   - nodes:       full Merkle tree node slice (needed to generate proofs)
+//   - nChunks:     total number of leaf chunks
+//   - leafHashes:  SHA-256 of every leaf chunk (used for post-upload
+//                  verification)
 func computeMerkleTreeFromReader(r io.ReaderAt, dataSize int64) (
 	dataRoot []byte,
 	nodes []merkleNode,
@@ -158,30 +149,34 @@ func computeMerkleTreeFromReader(r io.ReaderAt, dataSize int64) (
 	err error,
 ) {
 	if dataSize == 0 {
+		// Empty data: root = SHA-256(nil) (same as arweave convention)
 		h := sha256.Sum256(nil)
 		return h[:], nil, 0, nil, nil
 	}
 
 	nChunks = int((dataSize + ChunkSize - 1) / ChunkSize)
 
-	// ---- 1. read each chunk and compute leaf hashes ----
-	buf := make([]byte, ChunkSize)
-	leafHashes = make([][]byte, nChunks)
 	// Pre-allocate enough capacity for the full Merkle tree.
-	// Maximum node count: leaves + sum_{k>=1} ceil(leaves/2^k) ≤ 2*leaves + 1.
+	// Maximum node count: leaves + sum_{k>=1} ceil(leaves/2^k) ≤ 2×leaves + 1.
 	nodes = make([]merkleNode, 0, nChunks*2+1)
+	leafHashes = make([][]byte, nChunks)
+
+	buf := make([]byte, ChunkSize)
+
+	var cumulative uint64
 
 	for i := 0; i < nChunks; i++ {
-		offset := int64(i) * ChunkSize
-		end := offset + ChunkSize
+		start := int64(i) * ChunkSize
+		end := start + ChunkSize
 		if end > dataSize {
 			end = dataSize
 		}
-		chunkLen := int(end - offset)
+		chunkLen := int(end - start)
+		cumulative += uint64(chunkLen)
 
-		n, readErr := readFullAt(r, buf[:chunkLen], offset)
+		n, readErr := readFullAt(r, buf[:chunkLen], start)
 		if readErr != nil {
-			err = fmt.Errorf("read chunk %d at offset %d: %w", i, offset, readErr)
+			err = fmt.Errorf("read chunk %d at offset %d: %w", i, start, readErr)
 			return
 		}
 		if n < chunkLen {
@@ -189,54 +184,20 @@ func computeMerkleTreeFromReader(r io.ReaderAt, dataSize int64) (
 			return
 		}
 
-		h := sha256.Sum256(buf[:chunkLen])
+		// Leaf ID = SHA-256( SHA-256(chunk) || SHA-256(end_offset) )
+		chunkHash := sha256.Sum256(buf[:chunkLen])
+		leafID := chunkLeafHash(chunkHash[:], cumulative)
+
 		leafHashes[i] = make([]byte, 32)
-		copy(leafHashes[i], h[:])
-		nodes = append(nodes, merkleNode{hash: leafHashes[i], left: -1, right: -1})
+		copy(leafHashes[i], chunkHash[:])
+
+		nodes = append(nodes, merkleNode{hash: leafID, max: cumulative})
 	}
 
 	// ---- 2. build tree bottom-up ----
 	dataRoot, nodes = buildMerkleTree(nodes, nChunks)
 
 	return dataRoot, nodes, nChunks, leafHashes, nil
-}
-
-// buildMerkleTree builds the internal Merkle tree levels on top of existing
-// leaf nodes.  `nodes` must already contain the nChunks leaf nodes at the
-// front.  Returns the Merkle root hash and the (possibly reallocated) node
-// slice.
-func buildMerkleTree(nodes []merkleNode, nChunks int) ([]byte, []merkleNode) {
-	levelStart := 0
-	levelCount := nChunks
-	for levelCount > 1 {
-		nextLevelStart := len(nodes)
-		for i := 0; i < levelCount; i += 2 {
-			leftIdx := levelStart + i
-			if i+1 < levelCount {
-				rightIdx := levelStart + i + 1
-				combined := make([]byte, 64)
-				copy(combined[:32], nodes[leftIdx].hash)
-				copy(combined[32:], nodes[rightIdx].hash)
-				h := sha256.Sum256(combined)
-				nodes = append(nodes, merkleNode{
-					hash:  h[:],
-					left:  leftIdx,
-					right: rightIdx,
-				})
-			} else {
-				// Odd node → promote
-				nodes = append(nodes, merkleNode{
-					hash:  nodes[leftIdx].hash,
-					left:  leftIdx,
-					right: -1,
-				})
-			}
-		}
-		levelStart = nextLevelStart
-		levelCount = (levelCount + 1) / 2
-	}
-
-	return nodes[len(nodes)-1].hash, nodes
 }
 
 // readFullAt reads exactly len(buf) bytes from r starting at offset.
@@ -257,26 +218,124 @@ func readFullAt(r io.ReaderAt, buf []byte, offset int64) (int, error) {
 	return total, nil
 }
 
-// collectProof walks up the Merkle tree from leafIdx and collects sibling
-// hashes at each level.  nodes is the full node slice; leafCount is the
-// original number of leaves (nChunks).
-func collectProof(nodes []merkleNode, leafIdx int, leafCount int) []byte {
-	var proof bytes.Buffer
+// buildMerkleTree builds the internal Merkle tree levels on top of existing
+// leaf nodes.  `nodes` must already contain the nChunks leaf nodes at the
+// front.  Returns the Merkle root hash and the (possibly reallocated) node
+// slice.
+//
+// The algorithm: bottom-up, pairing adjacent nodes.  Odd nodes are promoted
+// (not duplicated).  This matches ar_merkle.erl:generate_row.
+func buildMerkleTree(nodes []merkleNode, nChunks int) ([]byte, []merkleNode) {
+	if nChunks == 0 {
+		h := sha256.Sum256(nil)
+		return h[:], nodes
+	}
+
+	levelStart := 0
+	levelCount := nChunks
+
+	for levelCount > 1 {
+		nextLevelStart := len(nodes)
+		for i := 0; i < levelCount; i += 2 {
+			leftIdx := levelStart + i
+			left := nodes[leftIdx]
+
+			if i+1 < levelCount {
+				rightIdx := levelStart + i + 1
+				right := nodes[rightIdx]
+
+				branchID := chunkBranchHash(left.hash, right.hash, left.max)
+				nodes = append(nodes, merkleNode{
+					hash: branchID,
+					max:  right.max, // right child's max becomes this subtree's max
+				})
+			} else {
+				// Odd node: promote to next level unchanged
+				nodes = append(nodes, merkleNode{
+					hash: left.hash,
+					max:  left.max,
+				})
+			}
+		}
+		levelStart = nextLevelStart
+		levelCount = (levelCount + 1) / 2
+	}
+
+	return nodes[len(nodes)-1].hash, nodes
+}
+
+// collectProof builds the Arweave data_path for a single chunk at leafIdx.
+//
+// Format (from root to leaf):
+//
+//	branch → [leftChild.id (32 B)] [rightChild.id (32 B)] [note (32 B)] | rest
+//	leaf   → [dataHash (32 B)] [endOffset note (32 B)]
+//
+// Important: when a node is PROMOTED (odd leaf at a level), no branch proof
+// segment is emitted for that level — the promoted node's hash is identical
+// to its child's, so the proof skips straight from the parent branch to the
+// leaf.  This matches ar_merkle.erl:generate_path_parts and the JavaScript
+// merkle.js:resolveBranchProofs.
+func collectProof(nodes []merkleNode, leafIdx int, nChunks int, leafDataHash []byte) []byte {
+	type branchLevel struct {
+		leftID  []byte
+		rightID []byte
+		note    []byte
+	}
+	var branches []branchLevel
 
 	idx := leafIdx
 	levelStart := 0
-	levelCount := leafCount
+	levelCount := nChunks
+
 	for levelCount > 1 {
-		siblingIdx := idx ^ 1 // flip LSB to get sibling index
-		if siblingIdx < levelCount {
-			proof.Write(nodes[levelStart+siblingIdx].hash)
+		parentIdx := idx / 2
+		parentPos := levelStart + levelCount + parentIdx
+
+		if parentPos >= len(nodes) {
+			break
 		}
-		idx = idx / 2
+
+		// Determine whether this parent is a real branch (two children) or
+		// a promoted node (odd child promoted, same hash).
+		leftChildIdx := levelStart + (parentIdx * 2)
+		if leftChildIdx+1 < levelStart+levelCount {
+			// Real branch: two children → emit a branch proof segment.
+			leftChild := nodes[leftChildIdx]
+			rightChild := nodes[leftChildIdx+1]
+
+			noteBuf := make([]byte, noteSize)
+			binary.BigEndian.PutUint64(noteBuf[noteSize-8:], leftChild.max)
+
+			branches = append(branches, branchLevel{
+				leftID:  leftChild.hash,
+				rightID: rightChild.hash,
+				note:    noteBuf,
+			})
+		}
+		// else: promoted node → skip (no branch segment for this level)
+
+		idx = parentIdx
 		levelStart = levelStart + levelCount
 		levelCount = (levelCount + 1) / 2
 	}
 
-	return proof.Bytes()
+	// Build the proof binary: branch segments (root-most first) + leaf
+	var buf bytes.Buffer
+	for i := len(branches) - 1; i >= 0; i-- {
+		b := branches[i]
+		buf.Write(b.leftID)
+		buf.Write(b.rightID)
+		buf.Write(b.note)
+	}
+
+	// Leaf: dataHash (32) + endOffset note (32)
+	buf.Write(leafDataHash)
+	noteBuf := make([]byte, noteSize)
+	binary.BigEndian.PutUint64(noteBuf[noteSize-8:], nodes[leafIdx].max)
+	buf.Write(noteBuf)
+
+	return buf.Bytes()
 }
 
 // =============================================================================
@@ -293,6 +352,8 @@ type chunkUploadRequest struct {
 }
 
 // submitChunk uploads a single chunk to the gateway.
+//   - offset is the *last byte index* of the chunk (end_offset - 1), matching
+//     the convention used by arweave-js's merkle.js.
 func (gc *GatewayClient) submitChunk(dataRoot string, dataSize int, dataPath string, offset int, chunkData []byte) error {
 	req := chunkUploadRequest{
 		DataRoot: dataRoot,
@@ -319,7 +380,8 @@ func (gc *GatewayClient) submitChunk(dataRoot string, dataSize int, dataPath str
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("gateway returned %d for chunk at offset %d: %s", resp.StatusCode, offset, string(respBody))
+		return fmt.Errorf("gateway returned %d for chunk at offset %d: %s",
+			resp.StatusCode, offset, string(respBody))
 	}
 
 	return nil
@@ -330,7 +392,7 @@ func (gc *GatewayClient) submitChunk(dataRoot string, dataSize int, dataPath str
 // =============================================================================
 
 // TransactionWithoutData is a transaction that omits the data field (used
-// for chunked uploads where data was already uploaded via /chunk).
+// for chunked uploads where data is uploaded separately via /chunk).
 type TransactionWithoutData struct {
 	Format    int    `json:"format"`
 	ID        string `json:"id"`
@@ -403,40 +465,50 @@ func (gc *GatewayClient) submitChunkedTransaction(tx *Transaction) (string, erro
 }
 
 // =============================================================================
-// Streaming chunk upload (second pass)
+// Streaming chunk upload (third pass — tx must be submitted first)
 // =============================================================================
 
 // uploadChunksStreaming re-reads data from reader, collects Merkle proofs
 // from the pre-computed tree nodes, and uploads each chunk to /chunk.
+//
+// IMPORTANT: The data_root must already be registered on the gateway
+// (by submitting the transaction via POST /tx) before calling this function.
 func (gc *GatewayClient) uploadChunksStreaming(
 	dataRoot string,
 	dataSize int,
 	reader io.ReaderAt,
 	nodes []merkleNode,
 	nChunks int,
+	leafHashes [][]byte,
 ) error {
 	buf := make([]byte, ChunkSize)
 
-	for i := 0; i < nChunks; i++ {
-		offset := i * ChunkSize
-		end := offset + ChunkSize
-		if end > dataSize {
-			end = dataSize
-		}
-		chunkLen := end - offset
+	var cumulative uint64
 
-		n, readErr := readFullAt(reader, buf[:chunkLen], int64(offset))
+	for i := 0; i < nChunks; i++ {
+		start := int64(i) * ChunkSize
+		end := start + ChunkSize
+		if end > int64(dataSize) {
+			end = int64(dataSize)
+		}
+		chunkLen := int(end - start)
+		cumulative += uint64(chunkLen)
+
+		n, readErr := readFullAt(reader, buf[:chunkLen], start)
 		if readErr != nil {
-			return fmt.Errorf("second pass: read chunk %d at offset %d: %w", i, offset, readErr)
+			return fmt.Errorf("third pass: read chunk %d at offset %d: %w", i, start, readErr)
 		}
 		if n < chunkLen {
-			return fmt.Errorf("second pass: short read at chunk %d: got %d, want %d", i, n, chunkLen)
+			return fmt.Errorf("third pass: short read at chunk %d: got %d, want %d", i, n, chunkLen)
 		}
 
-		proof := collectProof(nodes, i, nChunks)
+		proof := collectProof(nodes, i, nChunks, leafHashes[i])
 		dataPath := base64.RawURLEncoding.EncodeToString(proof)
 
-		if err := gc.submitChunk(dataRoot, dataSize, dataPath, offset, buf[:chunkLen]); err != nil {
+		// The offset sent to /chunk is end_offset - 1 (the last byte of the chunk)
+		chunkOffset := int(cumulative) - 1
+
+		if err := gc.submitChunk(dataRoot, dataSize, dataPath, chunkOffset, buf[:chunkLen]); err != nil {
 			return err
 		}
 	}
@@ -516,20 +588,15 @@ func (gc *GatewayClient) verifyAllChunks(txID string, merkleLeaves [][]byte, dat
 // =============================================================================
 
 // UploadDataChunkedStreaming uploads data to Arweave using the chunked
-// /chunk endpoint with two-pass streaming.
+// /chunk endpoint with multi-pass streaming.
 //
-// The Arweave node requires the transaction to be submitted BEFORE any
-// chunks are uploaded, because /chunk looks up the data_root in the node's
-// pending transaction pool.  Submitting chunks first results in a
-// "data_root_not_found" error.
-//
-// Flow:
+// CORRECT ORDER (matches gateway expectations):
 //   Pass 1:  compute Merkle tree via io.ReaderAt (only hashes in memory).
-//   Pass 2:  fetch anchor & reward, build, sign, and POST /tx (registers
-//            data_root on the node).
-//   Pass 3:  re-read and upload each chunk + Merkle proof (256 KiB buffer).
-//   Pass 4:  wait for transaction confirmation.
-//   Pass 5:  verify all chunks against the gateway.
+//   Pass 2:  fetch anchor & reward, build, sign, submit the transaction.
+//            This REGISTERS the data_root on the gateway.
+//   Pass 3:  re-read data and upload each chunk + Merkle proof to /chunk.
+//            (256 KiB buffer, one chunk at a time).
+//   Pass 4:  wait for confirmation & verify all chunks against the gateway.
 //
 // The reader must support io.ReaderAt (e.g. *os.File, *bytes.Reader).
 func (gc *GatewayClient) UploadDataChunkedStreaming(
@@ -556,31 +623,35 @@ func (gc *GatewayClient) UploadDataChunkedStreaming(
 		reward = "0"
 	}
 
-	// ---- 3. build & sign transaction ----
+	// ---- 3. build, sign & submit transaction FIRST ----
+	// The transaction MUST be submitted before uploading chunks because the
+	// gateway's ar_disk_pool:check_admission requires data_root to be
+	// registered (either in the disk pool via a submitted tx, or via synced
+	// data_roots from a mined block).  Uploading chunks before the tx results
+	// in "data_root_not_found".
 	tx := buildChunkedTransaction(wallet.Owner, int(dataSize), dataRoot, tags, reward, anchor)
 	if err := tx.Sign(wallet.PrivateKey); err != nil {
 		return nil, nil, fmt.Errorf("failed to sign chunked tx: %w", err)
 	}
 
-	// ---- 4. submit transaction FIRST (registers data_root on node) ----
 	txID, err := gc.submitChunkedTransaction(tx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to submit chunked tx: %w", err)
 	}
 	tx.ID = txID
 
-	// ---- 5. second pass: upload chunks (data_root now known to node) ----
-	if err := gc.uploadChunksStreaming(dataRoot, int(dataSize), reader, nodes, nChunks); err != nil {
-		return nil, nil, fmt.Errorf("second pass (chunk upload): %w", err)
+	// ---- 4. upload chunks ----
+	if err := gc.uploadChunksStreaming(dataRoot, int(dataSize), reader, nodes, nChunks, leafHashes); err != nil {
+		return nil, nil, fmt.Errorf("chunk upload: %w", err)
 	}
 
-	// ---- 6. wait for confirmation ----
+	// ---- 5. wait for confirmation ----
 	status, err := gc.WaitForConfirmation(txID, 120, 3*time.Second)
 	if err != nil {
 		return tx, nil, fmt.Errorf("submitted but unconfirmed: %w", err)
 	}
 
-	// ---- 7. verify every chunk integrity ----
+	// ---- 6. verify chunk integrity ----
 	if nChunks > 0 && len(leafHashes) > 0 {
 		if verr := gc.verifyAllChunks(txID, leafHashes, dataSize); verr != nil {
 			// Do NOT silently fail — verification errors must be surfaced.
@@ -589,6 +660,77 @@ func (gc *GatewayClient) UploadDataChunkedStreaming(
 	}
 
 	return tx, status, nil
+}
+
+// =============================================================================
+// Legacy in-memory Merkle tree (kept for backward compat and tests)
+// =============================================================================
+
+// chunkProof holds the Merkle proof for a single chunk.
+type chunkProof struct {
+	Offset int    // byte offset of this chunk in the original data
+	Chunk  []byte // raw chunk bytes (subslice of data)
+	Proof  []byte // Arweave data_path (Merkle proof)
+}
+
+// computeChunksAndProofs splits data into fixed-size chunks, builds an
+// annotated Merkle tree (matching ar_merkle.erl), and returns every chunk
+// together with its inclusion proof.
+//
+// Memory: chunk slices are subslices of data (no copy); the Merkle tree
+// temporarily allocates ~2× the number of leaf hashes × 40 bytes each.
+func computeChunksAndProofs(data []byte) (dataRoot []byte, results []chunkProof) {
+	nChunks := (len(data) + ChunkSize - 1) / ChunkSize
+	if nChunks == 0 {
+		h := sha256.Sum256(nil)
+		return h[:], nil
+	}
+
+	// ---- 1. leaf hashes ----
+	nodes := make([]merkleNode, 0, nChunks*2)
+	leafHashes := make([][]byte, nChunks)
+
+	var cumulative uint64
+	for i := 0; i < nChunks; i++ {
+		start := i * ChunkSize
+		end := start + ChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		cumulative += uint64(end - start)
+
+		chunkHash := sha256.Sum256(data[start:end])
+		leafID := chunkLeafHash(chunkHash[:], cumulative)
+
+		leafHashes[i] = make([]byte, 32)
+		copy(leafHashes[i], chunkHash[:])
+
+		nodes = append(nodes, merkleNode{hash: leafID, max: cumulative})
+	}
+
+	// ---- 2. build tree bottom-up ----
+	dataRoot, nodes = buildMerkleTree(nodes, nChunks)
+
+	// ---- 3. compute proof for each chunk ----
+	results = make([]chunkProof, nChunks)
+	cumulative = 0
+	for chunkIdx := 0; chunkIdx < nChunks; chunkIdx++ {
+		start := chunkIdx * ChunkSize
+		end := start + ChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		cumulative += uint64(end - start)
+
+		proof := collectProof(nodes, chunkIdx, nChunks, leafHashes[chunkIdx])
+		results[chunkIdx] = chunkProof{
+			Offset: start,
+			Chunk:  data[start:end],
+			Proof:  proof,
+		}
+	}
+
+	return dataRoot, results
 }
 
 // =============================================================================

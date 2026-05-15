@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,7 +20,7 @@ import (
 )
 
 // =============================================================================
-// Merkle tree tests
+// Merkle tree tests (annotated ar_merkle.erl format)
 // =============================================================================
 
 func TestComputeChunksAndProofs_Empty(t *testing.T) {
@@ -42,10 +43,11 @@ func TestComputeChunksAndProofs_SingleChunk(t *testing.T) {
 
 	root, proofs := computeChunksAndProofs(data)
 
-	// Root should be SHA-256 of the data
-	expected := sha256.Sum256(data)
-	if string(root) != string(expected[:]) {
-		t.Errorf("single chunk root mismatch")
+	// Root should be chunkLeafHash(SHA-256(data), 100)
+	chunkHash := sha256.Sum256(data)
+	expectedRoot := chunkLeafHash(chunkHash[:], 100)
+	if string(root) != string(expectedRoot) {
+		t.Errorf("single chunk root mismatch: got %x, expected %x", root, expectedRoot)
 	}
 
 	if len(proofs) != 1 {
@@ -58,13 +60,18 @@ func TestComputeChunksAndProofs_SingleChunk(t *testing.T) {
 	if string(proofs[0].Chunk) != string(data) {
 		t.Errorf("chunk data mismatch")
 	}
-	if len(proofs[0].Proof) != 0 {
-		t.Errorf("single chunk proof should be empty, got %d bytes", len(proofs[0].Proof))
+	// Single chunk: proof should be [dataHash(32)] [endOffset(32)] = 64 bytes
+	if len(proofs[0].Proof) != 64 {
+		t.Errorf("single chunk proof should be 64 bytes, got %d", len(proofs[0].Proof))
+	}
+
+	// Verify the proof reconstructs the root
+	if !verifyProofArweave(proofs[0], root, 1) {
+		t.Errorf("single chunk proof failed verification")
 	}
 }
 
 func TestComputeChunksAndProofs_TwoChunks(t *testing.T) {
-	// Two full chunks
 	data := make([]byte, ChunkSize*2)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -76,32 +83,9 @@ func TestComputeChunksAndProofs_TwoChunks(t *testing.T) {
 		t.Fatalf("expected 2 proofs, got %d", len(proofs))
 	}
 
-	// Verify root manually
-	h0 := sha256.Sum256(data[:ChunkSize])
-	h1 := sha256.Sum256(data[ChunkSize:])
-	combined := make([]byte, 64)
-	copy(combined[:32], h0[:])
-	copy(combined[32:], h1[:])
-	expectedRoot := sha256.Sum256(combined)
-
-	if string(root) != string(expectedRoot[:]) {
-		t.Errorf("two-chunk root mismatch")
-	}
-
-	// Proof for chunk 0: sibling = h1
-	if string(proofs[0].Proof) != string(h1[:]) {
-		t.Errorf("chunk 0 proof mismatch: got %x, expected %x", proofs[0].Proof, h1[:])
-	}
-
-	// Proof for chunk 1: sibling = h0
-	if string(proofs[1].Proof) != string(h0[:]) {
-		t.Errorf("chunk 1 proof mismatch: got %x, expected %x", proofs[1].Proof, h0[:])
-	}
-
-	// Verify each proof can reconstruct the root
+	// Verify all proofs
 	for i, cp := range proofs {
-		reconstructed := verifyProof(cp, root, 2)
-		if !reconstructed {
+		if !verifyProofArweave(cp, root, 2) {
 			t.Errorf("proof %d failed to verify against root", i)
 		}
 	}
@@ -119,50 +103,8 @@ func TestComputeChunksAndProofs_ThreeChunks(t *testing.T) {
 		t.Fatalf("expected 3 proofs, got %d", len(proofs))
 	}
 
-	// Verify manually
-	h0 := sha256.Sum256(data[0*ChunkSize:1*ChunkSize])
-	h1 := sha256.Sum256(data[1*ChunkSize:2*ChunkSize])
-	h2 := sha256.Sum256(data[2*ChunkSize:3*ChunkSize])
-
-	c01 := make([]byte, 64)
-	copy(c01[:32], h0[:])
-	copy(c01[32:], h1[:])
-	h01 := sha256.Sum256(c01)
-
-	c012 := make([]byte, 64)
-	copy(c012[:32], h01[:])
-	copy(c012[32:], h2[:])
-	expectedRoot := sha256.Sum256(c012)
-
-	if string(root) != string(expectedRoot[:]) {
-		t.Errorf("three-chunk root mismatch")
-	}
-
-	// Proof for chunk 0: h1 || h2
-	expectedP0 := make([]byte, 64)
-	copy(expectedP0[:32], h1[:])
-	copy(expectedP0[32:], h2[:])
-	if string(proofs[0].Proof) != string(expectedP0) {
-		t.Errorf("chunk 0 proof mismatch")
-	}
-
-	// Proof for chunk 1: h0 || h2
-	expectedP1 := make([]byte, 64)
-	copy(expectedP1[:32], h0[:])
-	copy(expectedP1[32:], h2[:])
-	if string(proofs[1].Proof) != string(expectedP1) {
-		t.Errorf("chunk 1 proof mismatch")
-	}
-
-	// Proof for chunk 2: h01 (no leaf sibling, one parent sibling)
-	expectedP2 := h01[:]
-	if string(proofs[2].Proof) != string(expectedP2) {
-		t.Errorf("chunk 2 proof mismatch: got %x, expected %x", proofs[2].Proof, expectedP2)
-	}
-
-	// Verify all proofs
 	for i, cp := range proofs {
-		if !verifyProof(cp, root, 3) {
+		if !verifyProofArweave(cp, root, 3) {
 			t.Errorf("proof %d (3-chunk) failed verification", i)
 		}
 	}
@@ -181,14 +123,13 @@ func TestComputeChunksAndProofs_FiveChunks(t *testing.T) {
 	}
 
 	for i, cp := range proofs {
-		if !verifyProof(cp, root, 5) {
+		if !verifyProofArweave(cp, root, 5) {
 			t.Errorf("proof %d (5-chunk) failed verification", i)
 		}
 	}
 }
 
 func TestComputeChunksAndProofs_PartialLastChunk(t *testing.T) {
-	// 2.5 chunks worth of data
 	data := make([]byte, ChunkSize*2+ChunkSize/2)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -200,13 +141,12 @@ func TestComputeChunksAndProofs_PartialLastChunk(t *testing.T) {
 		t.Fatalf("expected 3 proofs, got %d", len(proofs))
 	}
 
-	// Last chunk should be partial
 	if len(proofs[2].Chunk) != ChunkSize/2 {
 		t.Errorf("last chunk size mismatch: got %d, expected %d", len(proofs[2].Chunk), ChunkSize/2)
 	}
 
 	for i, cp := range proofs {
-		if !verifyProof(cp, root, 3) {
+		if !verifyProofArweave(cp, root, 3) {
 			t.Errorf("proof %d (partial) failed verification", i)
 		}
 	}
@@ -232,7 +172,6 @@ func TestComputeChunksDifferentDataDifferentRoot(t *testing.T) {
 	for i := range data2 {
 		data2[i] = byte(i % 256)
 	}
-	// data1 is all zeros, data2 has varied content
 
 	root1, _ := computeChunksAndProofs(data1)
 	root2, _ := computeChunksAndProofs(data2)
@@ -243,50 +182,79 @@ func TestComputeChunksDifferentDataDifferentRoot(t *testing.T) {
 }
 
 // =============================================================================
-// Proof verification helper
+// Proof verification helper (annotated ar_merkle.erl format)
 // =============================================================================
 
-// verifyProof checks that a chunk + proof reconstruct to the expected root.
-// totalChunks is the total number of chunks the data was split into.
-func verifyProof(cp chunkProof, root []byte, totalChunks int) bool {
-	leafHash := sha256.Sum256(cp.Chunk)
-
-	current := leafHash[:]
+// verifyProofArweave checks that an Arweave data_path proof reconstructs
+// to the expected Merkle root.  totalChunks is the total number of chunks.
+//
+// The proof format (matching ar_merkle.erl:validate_path and arweave-js
+// merkle.js:validatePath) is walked FORWARD from root to leaf:
+//
+//	root segment → [leftID(32)][rightID(32)][note(32)]
+//	  → compute branchHash, verify it matches expected parent ID
+//	  → recurse into left or right child based on the chunk offset
+//	... repeat ...
+//	leaf segment → [dataHash(32)][endOffset(32)]
+//	  → compute leafHash, verify it matches the last expected child ID
+func verifyProofArweave(cp chunkProof, root []byte, totalChunks int) bool {
 	proof := cp.Proof
-
-	idx := cp.Offset / ChunkSize
-	levelCount := totalChunks
-
-	for levelCount > 1 {
-		siblingIdx := idx ^ 1
-		if siblingIdx < levelCount {
-			// Sibling exists — consume 32 bytes from proof
-			if len(proof) < 32 {
-				return false
-			}
-			sibling := proof[:32]
-			proof = proof[32:]
-
-			var combined [64]byte
-			if idx%2 == 0 {
-				// current is left child
-				copy(combined[:32], current)
-				copy(combined[32:], sibling)
-			} else {
-				// current is right child
-				copy(combined[:32], sibling)
-				copy(combined[32:], current)
-			}
-			h := sha256.Sum256(combined[:])
-			current = h[:]
-		}
-		// else: no sibling, node is promoted — current stays the same
-
-		idx = idx / 2
-		levelCount = (levelCount + 1) / 2
+	if len(proof) < 64 {
+		return false
 	}
 
-	return string(current) == string(root)
+	// Determine the chunk's end offset and the "dest" byte (offset - 1,
+	// matching what gets sent to the /chunk endpoint).
+	endOffset := cp.Offset + len(cp.Chunk)
+	dest := endOffset - 1 // the byte we're proving inclusion for
+
+	// Walk the proof FORWARD (root → leaf)
+	remaining := proof
+	expectedID := root
+
+	for {
+		if len(remaining) == 64 {
+			// ---- Leaf: [dataHash(32)] [endOffset(32)] ----
+			leafData := remaining[:32]
+			leafNote := remaining[32:64]
+
+			// Verify leaf data hash matches the actual chunk
+			actualChunkHash := sha256.Sum256(cp.Chunk)
+			if !bytes.Equal(leafData, actualChunkHash[:]) {
+				return false
+			}
+
+			leafEndOffset := binary.BigEndian.Uint64(leafNote[noteSize-8:])
+			computedLeafID := chunkLeafHash(leafData, leafEndOffset)
+
+			return bytes.Equal(computedLeafID, expectedID)
+		}
+
+		if len(remaining) < 96 {
+			return false // malformed proof
+		}
+
+		// ---- Branch: [leftID(32)] [rightID(32)] [note(32)] ----
+		leftID := remaining[:32]
+		rightID := remaining[32:64]
+		note := remaining[64:96]
+		remaining = remaining[96:]
+
+		leftMax := binary.BigEndian.Uint64(note[noteSize-8:])
+
+		// Compute branch hash and verify it matches the expected ID
+		computedBranchID := chunkBranchHash(leftID, rightID, leftMax)
+		if !bytes.Equal(computedBranchID, expectedID) {
+			return false
+		}
+
+		// Decide which child to follow based on dest byte
+		if uint64(dest) < leftMax {
+			expectedID = leftID
+		} else {
+			expectedID = rightID
+		}
+	}
 }
 
 // =============================================================================
@@ -341,9 +309,7 @@ func newMockChunkedServer() *httptest.Server {
 			w.Write([]byte(`"mock-anchor"`))
 
 		case strings.HasPrefix(r.URL.Path, "/raw/") && r.Method == "GET":
-			// Serve data matching the test pattern (byte(i % 256)) for any byte
-			// range.  This supports multi-chunk verification.
-			dataSize := ChunkSize + 100 // matches the largest test data size
+			dataSize := ChunkSize + 100
 			w.Header().Set("Content-Type", "application/octet-stream")
 
 			start := int64(0)
@@ -439,7 +405,6 @@ func TestUploadData_AutoChunkedRouting(t *testing.T) {
 		Owner:      base64.RawURLEncoding.EncodeToString(nBytes),
 	}
 
-	// Data >= 256KB → should use chunked
 	largeData := make([]byte, ChunkSize+1)
 	for i := range largeData {
 		largeData[i] = byte(i % 256)
@@ -459,13 +424,11 @@ func TestUploadData_AutoChunkedRouting(t *testing.T) {
 }
 
 func TestUploadData_SmallDataOldPath(t *testing.T) {
-	// Test that small data still uses old /tx path
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/tx" && r.Method == "POST" {
 			var tx map[string]interface{}
 			json.NewDecoder(r.Body).Decode(&tx)
 			if _, hasData := tx["data"]; !hasData || tx["data"] == "" {
-				// For small data, must have data field
 				w.WriteHeader(http.StatusBadRequest)
 				w.Write([]byte(`{"error":"small data tx should have data field"}`))
 				return
@@ -514,7 +477,6 @@ func TestUploadData_SmallDataOldPath(t *testing.T) {
 }
 
 func TestUploadDataChunked_SignatureValid(t *testing.T) {
-	// Verify the transaction signature is valid for chunked txs
 	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("failed to generate key: %v", err)
@@ -528,7 +490,6 @@ func TestUploadDataChunked_SignatureValid(t *testing.T) {
 		data[i] = byte(i % 256)
 	}
 
-	// Compute root
 	root, _ := computeChunksAndProofs(data)
 	dataRoot := base64.RawURLEncoding.EncodeToString(root)
 
@@ -544,7 +505,6 @@ func TestUploadDataChunked_SignatureValid(t *testing.T) {
 		t.Fatal("empty ID")
 	}
 
-	// Verify signature against the same deep hash
 	sigData := tx.deepHash()
 	hashed := sha256.Sum256(sigData)
 
@@ -569,8 +529,6 @@ func TestUploadDataChunked_SignatureValid(t *testing.T) {
 // =============================================================================
 
 func TestComputeMerkleTreeFromReader_MatchesInMemory(t *testing.T) {
-	// Verify that the streaming Merkle tree produces the same root as the
-	// in-memory version for various data sizes.
 	sizes := []int{
 		0,
 		100,
@@ -587,7 +545,7 @@ func TestComputeMerkleTreeFromReader_MatchesInMemory(t *testing.T) {
 			data[i] = byte(i % 256)
 		}
 
-		// In-memory
+		// In-memory (annotated Merkle)
 		rootMem, _ := computeChunksAndProofs(data)
 
 		// Streaming via bytes.NewReader
@@ -601,41 +559,21 @@ func TestComputeMerkleTreeFromReader_MatchesInMemory(t *testing.T) {
 			t.Errorf("size=%d: root mismatch; in-memory=%x streaming=%x", size, rootMem, rootStream)
 		}
 
-		// Verify leaf hashes match chunk hashes
+		// Verify proof for each chunk
 		if nChunks > 0 {
-			if len(leafHashes) != nChunks {
-				t.Errorf("size=%d: expected %d leaf hashes, got %d", size, nChunks, len(leafHashes))
-			}
-
-			// Spot-check: verify each leaf hash against directly computed hash
 			for i := 0; i < nChunks; i++ {
 				start := i * ChunkSize
 				end := start + ChunkSize
 				if end > size {
 					end = size
 				}
-				expectedHash := sha256.Sum256(data[start:end])
-				if !bytes.Equal(leafHashes[i], expectedHash[:]) {
-					t.Errorf("size=%d chunk %d: leaf hash mismatch", size, i)
-				}
-			}
-
-			// Verify proof for each chunk
-			_ = nodesStream
-			for i := 0; i < nChunks; i++ {
-				proof := collectProof(nodesStream, i, nChunks)
-				start := i * ChunkSize
-				end := start + ChunkSize
-				if end > size {
-					end = size
-				}
-				// Verify using the in-memory verification helper
+				proof := collectProof(nodesStream, i, nChunks, leafHashes[i])
 				cp := chunkProof{
 					Offset: start,
 					Chunk:  data[start:end],
 					Proof:  proof,
 				}
-				if !verifyProof(cp, rootStream, nChunks) {
+				if !verifyProofArweave(cp, rootStream, nChunks) {
 					t.Errorf("size=%d chunk %d: proof verification failed", size, i)
 				}
 			}
@@ -649,7 +587,7 @@ func TestComputeMerkleTreeFromReader_MatchesInMemory(t *testing.T) {
 
 type brokenReaderAt struct {
 	data       []byte
-	failAtByte int64 // return an error after reading this many bytes
+	failAtByte int64
 }
 
 func (b *brokenReaderAt) ReadAt(p []byte, off int64) (int, error) {
@@ -676,7 +614,6 @@ func TestComputeMerkleTreeFromReader_ReadError(t *testing.T) {
 		data[i] = byte(i % 256)
 	}
 
-	// Fail at the second chunk (offset ChunkSize)
 	broken := &brokenReaderAt{data: data, failAtByte: ChunkSize}
 	_, _, _, _, err := computeMerkleTreeFromReader(broken, int64(len(data)))
 	if err == nil {
@@ -686,27 +623,24 @@ func TestComputeMerkleTreeFromReader_ReadError(t *testing.T) {
 }
 
 func TestUploadChunksStreaming_ReadError(t *testing.T) {
-	// Test that second-pass read errors are propagated
 	data := make([]byte, ChunkSize*2)
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
 
-	// First pass succeeds (use a good reader)
 	goodReader := bytes.NewReader(data)
-	_, nodes, nChunks, _, err := computeMerkleTreeFromReader(goodReader, int64(len(data)))
+	_, nodes, nChunks, leafHashes, err := computeMerkleTreeFromReader(goodReader, int64(len(data)))
 	if err != nil {
 		t.Fatalf("first pass failed: %v", err)
 	}
 
-	// Second pass: break at offset zero (first chunk read fails)
 	broken := &brokenReaderAt{data: data, failAtByte: 0}
 
 	server := newMockChunkedServer()
 	defer server.Close()
 	client := NewGatewayClient(server.URL)
 
-	err = client.uploadChunksStreaming("mock-root", len(data), broken, nodes, nChunks)
+	err = client.uploadChunksStreaming("mock-root", len(data), broken, nodes, nChunks, leafHashes)
 	if err == nil {
 		t.Fatal("expected error from broken reader in second pass, got nil")
 	}
@@ -718,13 +652,11 @@ func TestUploadChunksStreaming_ReadError(t *testing.T) {
 // =============================================================================
 
 func TestVerifyAllChunks_Success(t *testing.T) {
-	// Create multi-chunk test data and a mock server that serves correct chunks.
 	data := make([]byte, ChunkSize*3+100)
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
 
-	// Pre-compute the Merkle leaf hashes for all chunks.
 	nChunks := (len(data) + ChunkSize - 1) / ChunkSize
 	leafHashes := make([][]byte, nChunks)
 	for i := 0; i < nChunks; i++ {
@@ -772,7 +704,6 @@ func TestVerifyAllChunks_Success(t *testing.T) {
 }
 
 func TestVerifyAllChunks_Corruption(t *testing.T) {
-	// Return corrupted data for chunk 1 → verification must fail.
 	data := make([]byte, ChunkSize*3+100)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -791,7 +722,6 @@ func TestVerifyAllChunks_Corruption(t *testing.T) {
 		copy(leafHashes[i], h[:])
 	}
 
-	// Corrupt chunk index to detect
 	corruptIdx := 1
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -814,11 +744,9 @@ func TestVerifyAllChunks_Corruption(t *testing.T) {
 				chunk[i] = byte((start + i) % 256)
 			}
 
-			// Corrupt data if the request covers the corrupted chunk
 			corruptStart := int64(corruptIdx * ChunkSize)
 			corruptEnd := corruptStart + int64(ChunkSize) - 1
 			if start <= corruptEnd && end >= corruptStart {
-				// Flip a byte in the overlapping region
 				for i := int64(0); i < int64(len(chunk)); i++ {
 					absIdx := start + i
 					if absIdx >= corruptStart && absIdx <= corruptEnd {
@@ -843,7 +771,6 @@ func TestVerifyAllChunks_Corruption(t *testing.T) {
 }
 
 func TestVerifyAllChunks_EmptyResponse(t *testing.T) {
-	// Return empty body for chunk 0 → verification must fail.
 	data := make([]byte, ChunkSize*2)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -862,7 +789,6 @@ func TestVerifyAllChunks_EmptyResponse(t *testing.T) {
 		copy(leafHashes[i], h[:])
 	}
 
-	// Track requests — serve empty for the first chunk request
 	var requestCount int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -870,12 +796,10 @@ func TestVerifyAllChunks_EmptyResponse(t *testing.T) {
 			w.Header().Set("Content-Type", "application/octet-stream")
 
 			if atomic.AddInt32(&requestCount, 1) == 1 {
-				// First request: return empty body (data not available)
 				w.WriteHeader(http.StatusOK)
 				return
 			}
 
-			// Subsequent requests: serve correct data
 			start := int64(0)
 			end := int64(len(data)) - 1
 			if rng := r.Header.Get("Range"); rng != "" {
@@ -904,9 +828,3 @@ func TestVerifyAllChunks_EmptyResponse(t *testing.T) {
 	}
 	t.Logf("Empty response correctly detected: %v", err)
 }
-
-// =============================================================================
-// Test helpers
-// =============================================================================
-
-// verifyProof belongs to the Merkle tree section above.
