@@ -7,10 +7,11 @@
 //  1. First pass:  stream data via io.ReaderAt, compute SHA-256 leaf hashes
 //     and build a Merkle tree → data_root.  Only tree nodes (32 B each) stay
 //     in memory.
-//  2. Second pass: re-read data via io.ReaderAt, upload each chunk + Merkle
+//  2. Build, sign, and POST /tx to register data_root on the node.
+//  3. Second pass: re-read data via io.ReaderAt, upload each chunk + Merkle
 //     proof to /chunk.  Memory: 256 KiB buffer.
-//  3. Build & sign tx, POST /tx, confirm.
-//  4. Verify all chunks via GET /raw/{txID} (Range requests).
+//  4. Wait for transaction confirmation.
+//  5. Verify all chunks via GET /raw/{txID} (Range requests).
 //
 // Legacy inline-data path (UploadData) is auto-selected for data < 256 KiB.
 package arweave
@@ -517,10 +518,18 @@ func (gc *GatewayClient) verifyAllChunks(txID string, merkleLeaves [][]byte, dat
 // UploadDataChunkedStreaming uploads data to Arweave using the chunked
 // /chunk endpoint with two-pass streaming.
 //
-// Pass 1:  compute Merkle tree via io.ReaderAt (only hashes in memory).
-// Pass 2:  re-read and upload each chunk + Merkle proof (256 KiB buffer).
-// Pass 3:  build, sign, submit the transaction and wait for confirmation.
-// Pass 4:  verify all chunks against the gateway.
+// The Arweave node requires the transaction to be submitted BEFORE any
+// chunks are uploaded, because /chunk looks up the data_root in the node's
+// pending transaction pool.  Submitting chunks first results in a
+// "data_root_not_found" error.
+//
+// Flow:
+//   Pass 1:  compute Merkle tree via io.ReaderAt (only hashes in memory).
+//   Pass 2:  fetch anchor & reward, build, sign, and POST /tx (registers
+//            data_root on the node).
+//   Pass 3:  re-read and upload each chunk + Merkle proof (256 KiB buffer).
+//   Pass 4:  wait for transaction confirmation.
+//   Pass 5:  verify all chunks against the gateway.
 //
 // The reader must support io.ReaderAt (e.g. *os.File, *bytes.Reader).
 func (gc *GatewayClient) UploadDataChunkedStreaming(
@@ -536,12 +545,7 @@ func (gc *GatewayClient) UploadDataChunkedStreaming(
 	}
 	dataRoot := base64.RawURLEncoding.EncodeToString(dataRootHash)
 
-	// ---- 2. second pass: upload chunks ----
-	if err := gc.uploadChunksStreaming(dataRoot, int(dataSize), reader, nodes, nChunks); err != nil {
-		return nil, nil, fmt.Errorf("second pass (chunk upload): %w", err)
-	}
-
-	// ---- 3. fetch anchor & reward ----
+	// ---- 2. fetch anchor & reward ----
 	anchor, err := gc.GetAnchor()
 	if err != nil {
 		anchor = ""
@@ -552,18 +556,23 @@ func (gc *GatewayClient) UploadDataChunkedStreaming(
 		reward = "0"
 	}
 
-	// ---- 4. build & sign transaction ----
+	// ---- 3. build & sign transaction ----
 	tx := buildChunkedTransaction(wallet.Owner, int(dataSize), dataRoot, tags, reward, anchor)
 	if err := tx.Sign(wallet.PrivateKey); err != nil {
 		return nil, nil, fmt.Errorf("failed to sign chunked tx: %w", err)
 	}
 
-	// ---- 5. submit transaction ----
+	// ---- 4. submit transaction FIRST (registers data_root on node) ----
 	txID, err := gc.submitChunkedTransaction(tx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to submit chunked tx: %w", err)
 	}
 	tx.ID = txID
+
+	// ---- 5. second pass: upload chunks (data_root now known to node) ----
+	if err := gc.uploadChunksStreaming(dataRoot, int(dataSize), reader, nodes, nChunks); err != nil {
+		return nil, nil, fmt.Errorf("second pass (chunk upload): %w", err)
+	}
 
 	// ---- 6. wait for confirmation ----
 	status, err := gc.WaitForConfirmation(txID, 120, 3*time.Second)
@@ -571,7 +580,7 @@ func (gc *GatewayClient) UploadDataChunkedStreaming(
 		return tx, nil, fmt.Errorf("submitted but unconfirmed: %w", err)
 	}
 
-	// ---- 7. verify first chunk integrity ----
+	// ---- 7. verify every chunk integrity ----
 	if nChunks > 0 && len(leafHashes) > 0 {
 		if verr := gc.verifyAllChunks(txID, leafHashes, dataSize); verr != nil {
 			// Do NOT silently fail — verification errors must be surfaced.
