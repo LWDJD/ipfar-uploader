@@ -2,6 +2,7 @@
 package uploader
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,13 +20,15 @@ type remoteCarReader struct {
 	gateway *arweave.GatewayClient
 	txID    string
 	size    int64 // total file size in bytes
+	ctx     context.Context
 }
 
-func newRemoteCarReader(gateway *arweave.GatewayClient, txID string, size int64) *remoteCarReader {
+func newRemoteCarReader(ctx context.Context, gateway *arweave.GatewayClient, txID string, size int64) *remoteCarReader {
 	return &remoteCarReader{
 		gateway: gateway,
 		txID:    txID,
 		size:    size,
+		ctx:     ctx,
 	}
 }
 
@@ -40,7 +43,7 @@ func (r *remoteCarReader) ReadAt(p []byte, off int64) (n int, err error) {
 		end = r.size - 1
 	}
 
-	data, err := r.gateway.DownloadTransactionDataRange(r.txID, off, end)
+	data, err := r.gateway.DownloadTransactionDataRange(r.ctx, r.txID, off, end)
 	if err != nil {
 		return 0, fmt.Errorf("remote read [%d-%d]: %w", off, end, err)
 	}
@@ -55,10 +58,10 @@ func (r *remoteCarReader) ReadAt(p []byte, off int64) (n int, err error) {
 // getRemoteFileSize fetches the total byte size of a remote transaction's
 // data via a HEAD request to the Arweave gateway.  Returns 0 and an error
 // when the gateway does not expose a Content-Length header.
-func getRemoteFileSize(gateway *arweave.GatewayClient, txID string) (int64, error) {
+func getRemoteFileSize(ctx context.Context, gateway *arweave.GatewayClient, txID string) (int64, error) {
 	url := gateway.GatewayURL + "/" + txID
 
-	req, err := http.NewRequest(http.MethodHead, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create HEAD request: %w", err)
 	}
@@ -90,15 +93,15 @@ func getRemoteFileSize(gateway *arweave.GatewayClient, txID string) (int64, erro
 //  4. Index passes ValidateIndex (boundary sanity)
 //
 // Returns (true, nil) when the CAR passes every check.
-func VerifyRemoteCAR(gateway *arweave.GatewayClient, txID string, expectedRootCID string) (bool, error) {
+func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID string, expectedRootCID string) (bool, error) {
 	// ── 1. Get remote file size ─────────────────────────────────────────
-	fileSize, err := getRemoteFileSize(gateway, txID)
+	fileSize, err := getRemoteFileSize(ctx, gateway, txID)
 	if err != nil {
 		return false, fmt.Errorf("failed to get remote file size: %w", err)
 	}
 
 	// ── 2. Create SDK parser backed by remote reader ────────────────────
-	reader := newRemoteCarReader(gateway, txID, fileSize)
+	reader := newRemoteCarReader(ctx, gateway, txID, fileSize)
 	parser, err := sdkcar.NewCarParserFromReader(reader, fileSize)
 	if err != nil {
 		return false, fmt.Errorf("failed to create CAR parser: %w", err)

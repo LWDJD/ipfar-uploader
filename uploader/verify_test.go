@@ -2,6 +2,7 @@
 package uploader
 
 import (
+	"context"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -94,7 +95,7 @@ func TestVerifyRemoteCAR_LegacyFormat(t *testing.T) {
 	gateway, txID, cleanup := newMockGateway(t, carBytes)
 	defer cleanup()
 
-	verified, err := VerifyRemoteCAR(gateway, txID, rootCID.String())
+	verified, err := VerifyRemoteCAR(context.Background(), gateway, txID, rootCID.String())
 	if err != nil {
 		t.Fatalf("VerifyRemoteCAR failed: %v", err)
 	}
@@ -115,7 +116,7 @@ func TestVerifyRemoteCAR_WrongRootCID(t *testing.T) {
 
 	// Use a completely unrelated CID
 	wrongCID := "bafkreihdwdcefgh4dykjdu2qoz3zhvxhi6h33jqujfqmywf5teehzzzzzz"
-	verified, err := VerifyRemoteCAR(gateway, txID, wrongCID)
+	verified, err := VerifyRemoteCAR(context.Background(), gateway, txID, wrongCID)
 	if err == nil {
 		t.Fatal("expected error for wrong root CID, got nil")
 	}
@@ -135,7 +136,7 @@ func TestVerifyRemoteCAR_InvalidCID(t *testing.T) {
 	gateway, txID, cleanup := newMockGateway(t, carBytes)
 	defer cleanup()
 
-	verified, err := VerifyRemoteCAR(gateway, txID, "not-a-valid-cid!!!")
+	verified, err := VerifyRemoteCAR(context.Background(), gateway, txID, "not-a-valid-cid!!!")
 	if err == nil {
 		t.Fatal("expected error for invalid CID")
 	}
@@ -152,7 +153,7 @@ func TestVerifyRemoteCAR_EmptyFile(t *testing.T) {
 	gateway, txID, cleanup := newMockGateway(t, carBytes)
 	defer cleanup()
 
-	verified, err := VerifyRemoteCAR(gateway, txID, "bafkreihdwdcefgh4dykjdu2qoz3zhvxhi6h33jqujfqmywf5teehzzzzzz")
+	verified, err := VerifyRemoteCAR(context.Background(), gateway, txID, "bafkreihdwdcefgh4dykjdu2qoz3zhvxhi6h33jqujfqmywf5teehzzzzzz")
 	if err == nil {
 		t.Fatal("expected error for empty/small file")
 	}
@@ -171,7 +172,7 @@ func TestVerifyRemoteCAR_CBORFormat(t *testing.T) {
 	gateway, txID, cleanup := newMockGateway(t, carBytes)
 	defer cleanup()
 
-	verified, err := VerifyRemoteCAR(gateway, txID, rootCID.String())
+	verified, err := VerifyRemoteCAR(context.Background(), gateway, txID, rootCID.String())
 	if err != nil {
 		t.Fatalf("VerifyRemoteCAR failed for CBOR-format CAR: %v", err)
 	}
@@ -193,7 +194,7 @@ func TestVerifyRemoteCAR_MultipleRequests(t *testing.T) {
 	gateway, txID, cleanup := newMockGateway(t, carBytes)
 	defer cleanup()
 
-	verified, err := VerifyRemoteCAR(gateway, txID, rootCID.String())
+	verified, err := VerifyRemoteCAR(context.Background(), gateway, txID, rootCID.String())
 	if err != nil {
 		t.Fatalf("VerifyRemoteCAR failed: %v", err)
 	}

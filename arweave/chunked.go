@@ -18,6 +18,7 @@ package arweave
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -47,17 +48,19 @@ const noteSize = goartypes.NOTE_SIZE
 // =============================================================================
 
 // submitChunkGoar uploads a single chunk to the gateway using goar's format.
-func (gc *GatewayClient) submitChunkGoar(gcGoar *goartypes.GetChunk) error {
+func (gc *GatewayClient) submitChunkGoar(ctx context.Context, gcGoar *goartypes.GetChunk) error {
 	body, err := gcGoar.Marshal()
 	if err != nil {
 		return fmt.Errorf("failed to marshal chunk request: %w", err)
 	}
 
-	resp, err := gc.client.Post(
-		gc.GatewayURL+"/chunk",
-		"application/json",
-		bytes.NewReader(body),
-	)
+	req, err := http.NewRequestWithContext(ctx, "POST", gc.GatewayURL+"/chunk", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create chunk request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := gc.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to upload chunk at offset %s: %w", gcGoar.Offset, err)
 	}
@@ -84,17 +87,19 @@ func signTxGoar(tx *goartypes.Transaction, wallet *Wallet) error {
 }
 
 // submitChunkedTransactionGoar posts a transaction without data to /tx.
-func (gc *GatewayClient) submitChunkedTransactionGoar(tx *goartypes.Transaction) (string, error) {
+func (gc *GatewayClient) submitChunkedTransactionGoar(ctx context.Context, tx *goartypes.Transaction) (string, error) {
 	body, err := marshalTxWithoutData(tx)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal chunked tx: %w", err)
 	}
 
-	resp, err := gc.client.Post(
-		gc.GatewayURL+"/tx",
-		"application/json",
-		bytes.NewReader(body),
-	)
+	req, err := http.NewRequestWithContext(ctx, "POST", gc.GatewayURL+"/tx", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := gc.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to submit chunked tx: %w", err)
 	}
@@ -137,9 +142,16 @@ func marshalTxWithoutData(tx *goartypes.Transaction) ([]byte, error) {
 // =============================================================================
 
 // uploadChunksGoar uploads all chunks using goar's GetChunk / GetChunkStream.
-func (gc *GatewayClient) uploadChunksGoar(tx *goartypes.Transaction, data []byte, dataReader *os.File) error {
+// The loop respects context cancellation.
+func (gc *GatewayClient) uploadChunksGoar(ctx context.Context, tx *goartypes.Transaction, data []byte, dataReader *os.File) error {
 	nChunks := len(tx.Chunks.Chunks)
 	for i := 0; i < nChunks; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		var gcChunk *goartypes.GetChunk
 		var err error
 
@@ -153,7 +165,7 @@ func (gc *GatewayClient) uploadChunksGoar(tx *goartypes.Transaction, data []byte
 			return fmt.Errorf("failed to get chunk %d: %w", i, err)
 		}
 
-		if err := gc.submitChunkGoar(gcChunk); err != nil {
+		if err := gc.submitChunkGoar(ctx, gcChunk); err != nil {
 			return err
 		}
 	}
@@ -165,7 +177,8 @@ func (gc *GatewayClient) uploadChunksGoar(tx *goartypes.Transaction, data []byte
 // =============================================================================
 
 // verifyAllChunks downloads every chunk and verifies SHA-256 against expected hashes.
-func (gc *GatewayClient) verifyAllChunks(txID string, tx *goartypes.Transaction, dataSize int64) error {
+// The loop respects context cancellation.
+func (gc *GatewayClient) verifyAllChunks(ctx context.Context, txID string, tx *goartypes.Transaction, dataSize int64) error {
 	nChunks := len(tx.Chunks.Chunks)
 	if nChunks == 0 {
 		return nil
@@ -178,11 +191,17 @@ func (gc *GatewayClient) verifyAllChunks(txID string, tx *goartypes.Transaction,
 	}
 
 	for i := 0; i < nChunks; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		chunk := tx.Chunks.Chunks[i]
 		offset := int64(chunk.MinByteRange)
 		fetchLen := chunk.MaxByteRange - chunk.MinByteRange
 
-		req, err := http.NewRequest("GET", gc.GatewayURL+"/raw/"+txID, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", gc.GatewayURL+"/raw/"+txID, nil)
 		if err != nil {
 			return fmt.Errorf("verify chunk %d/%d: failed to create request: %w", i, nChunks, err)
 		}
@@ -263,14 +282,14 @@ func buildGoarTransaction(owner string, dataSize int64, tags []Tag, reward strin
 
 // UploadDataChunked uploads data to Arweave using the chunked /chunk endpoint.
 // It uses goar's Merkle tree, deep hash signing, and chunk management.
-func (gc *GatewayClient) UploadDataChunked(wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
-	return gc.uploadDataChunkedInternal(wallet, data, nil, int64(len(data)), tags)
+func (gc *GatewayClient) UploadDataChunked(ctx context.Context, wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
+	return gc.uploadDataChunkedInternal(ctx, wallet, data, nil, int64(len(data)), tags)
 }
 
-// UploadDataChunkedStreaming uploads data from an os.File (streaming).
+// UploadDataChunkedStreamingFile uploads data from an os.File (streaming).
 // Prefer this for large files to avoid loading the entire file into memory.
-func (gc *GatewayClient) UploadDataChunkedStreamingFile(wallet *Wallet, file *os.File, dataSize int64, tags []Tag) (*Transaction, *TransactionStatus, error) {
-	return gc.uploadDataChunkedInternal(wallet, nil, file, dataSize, tags)
+func (gc *GatewayClient) UploadDataChunkedStreamingFile(ctx context.Context, wallet *Wallet, file *os.File, dataSize int64, tags []Tag) (*Transaction, *TransactionStatus, error) {
+	return gc.uploadDataChunkedInternal(ctx, wallet, nil, file, dataSize, tags)
 }
 
 // uploadDataChunkedInternal is the common implementation for chunked upload.
@@ -279,6 +298,7 @@ func (gc *GatewayClient) UploadDataChunkedStreamingFile(wallet *Wallet, file *os
 // Transient gateway errors (502, 503, 504) are automatically retried up to
 // 3 times with exponential backoff (1s → 2s → 4s).
 func (gc *GatewayClient) uploadDataChunkedInternal(
+	ctx context.Context,
 	wallet *Wallet,
 	data []byte,
 	dataReader *os.File,
@@ -299,12 +319,12 @@ func (gc *GatewayClient) uploadDataChunkedInternal(
 	}
 
 	// Fetch anchor & reward
-	anchor, err := gc.GetAnchor()
+	anchor, err := gc.GetAnchor(ctx)
 	if err != nil {
 		anchor = ""
 	}
 
-	reward, err := gc.GetReward(dataSize)
+	reward, err := gc.GetReward(ctx, dataSize)
 	if err != nil {
 		reward = "0"
 	}
@@ -329,10 +349,10 @@ func (gc *GatewayClient) uploadDataChunkedInternal(
 	var txID string
 	var status *TransactionStatus
 
-	err = retryWithBackoff(func() error {
+	err = retryWithBackoff(ctx, func() error {
 		// ---- 3. submit transaction (registers data_root on gateway) ----
 		var sErr error
-		txID, sErr = gc.submitChunkedTransactionGoar(tx)
+		txID, sErr = gc.submitChunkedTransactionGoar(ctx, tx)
 		if sErr != nil {
 			return fmt.Errorf("failed to submit chunked tx: %w", sErr)
 		}
@@ -340,21 +360,21 @@ func (gc *GatewayClient) uploadDataChunkedInternal(
 
 		// ---- 4. upload chunks ----
 		if dataSize > 0 {
-			if cErr := gc.uploadChunksGoar(tx, data, dataReader); cErr != nil {
+			if cErr := gc.uploadChunksGoar(ctx, tx, data, dataReader); cErr != nil {
 				return fmt.Errorf("chunk upload: %w", cErr)
 			}
 		}
 
 		// ---- 5. wait for confirmation ----
 		var cErr error
-		status, cErr = gc.WaitForConfirmation(txID, 120, 3*time.Second)
+		status, cErr = gc.WaitForConfirmation(ctx, txID, 120, 3*time.Second)
 		if cErr != nil {
 			return fmt.Errorf("submitted but unconfirmed: %w", cErr)
 		}
 
 		// ---- 6. verify chunk integrity ----
 		if dataSize > 0 {
-			if verr := gc.verifyAllChunks(txID, tx, dataSize); verr != nil {
+			if verr := gc.verifyAllChunks(ctx, txID, tx, dataSize); verr != nil {
 				return fmt.Errorf("post-upload verification failed: %w", verr)
 			}
 		}
@@ -406,6 +426,7 @@ func convTxGoarToLegacy(gtx *goartypes.Transaction) *Transaction {
 // and goar's *os.File API. For very large data, use UploadDataChunkedStreamingFile
 // directly with an *os.File to avoid the copy.
 func (gc *GatewayClient) UploadDataChunkedStreaming(
+	ctx context.Context,
 	wallet *Wallet,
 	reader io.ReaderAt,
 	dataSize int64,
@@ -421,7 +442,7 @@ func (gc *GatewayClient) UploadDataChunkedStreaming(
 		if int64(n) < dataSize {
 			return nil, nil, fmt.Errorf("short read: got %d bytes, expected %d", n, dataSize)
 		}
-		return gc.UploadDataChunked(wallet, data, tags)
+		return gc.UploadDataChunked(ctx, wallet, data, tags)
 	}
 
 	// For very large data, create a temp file and use the streaming API
@@ -436,6 +457,12 @@ func (gc *GatewayClient) UploadDataChunkedStreaming(
 	buf := make([]byte, goartypes.MAX_CHUNK_SIZE)
 	var totalRead int64
 	for totalRead < dataSize {
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		default:
+		}
+
 		toRead := int64(len(buf))
 		if remaining := dataSize - totalRead; remaining < toRead {
 			toRead = remaining
@@ -459,7 +486,7 @@ func (gc *GatewayClient) UploadDataChunkedStreaming(
 		return nil, nil, fmt.Errorf("failed to seek temp file: %w", err)
 	}
 
-	return gc.UploadDataChunkedStreamingFile(wallet, tmpFile, dataSize, tags)
+	return gc.UploadDataChunkedStreamingFile(ctx, wallet, tmpFile, dataSize, tags)
 }
 
 // readFullAt reads exactly len(buf) bytes from r starting at offset.

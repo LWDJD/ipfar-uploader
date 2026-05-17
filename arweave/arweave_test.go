@@ -1,6 +1,7 @@
 package arweave
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -206,13 +207,13 @@ func TestGatewayClient_Mock(t *testing.T) {
 
 	client := NewGatewayClient(server.URL)
 
-	reward, err := client.GetReward(0)
+	reward, err := client.GetReward(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("GetReward failed: %v", err)
 	}
 	t.Logf("Reward: %s", reward)
 
-	anchor, err := client.GetAnchor()
+	anchor, err := client.GetAnchor(context.Background())
 	if err != nil {
 		t.Fatalf("GetAnchor failed: %v", err)
 	}
@@ -226,13 +227,13 @@ func TestGatewayClient_Mock(t *testing.T) {
 	tx := tb.Build()
 	tx.Sign(privKey)
 
-	txID, err := client.SubmitTransaction(tx)
+	txID, err := client.SubmitTransaction(context.Background(), tx)
 	if err != nil {
 		t.Fatalf("SubmitTransaction failed: %v", err)
 	}
 	t.Logf("Submitted TX ID: %s", txID)
 
-	status, err := client.GetTransactionStatus(txID)
+	status, err := client.GetTransactionStatus(context.Background(), txID)
 	if err != nil {
 		t.Fatalf("GetTransactionStatus failed: %v", err)
 	}
@@ -256,7 +257,7 @@ func TestWaitForConfirmation(t *testing.T) {
 	defer server.Close()
 
 	client := NewGatewayClient(server.URL)
-	status, err := client.WaitForConfirmation("test-tx", 5, 1*time.Millisecond)
+	status, err := client.WaitForConfirmation(context.Background(), "test-tx", 5, 1*time.Millisecond)
 	if err != nil {
 		t.Fatalf("WaitForConfirmation failed: %v", err)
 	}

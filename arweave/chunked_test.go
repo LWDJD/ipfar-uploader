@@ -1,6 +1,7 @@
 package arweave
 
 import (
+	"context"
 	"bytes"
 	"crypto"
 	"crypto/rand"
@@ -311,7 +312,7 @@ func TestUploadDataChunked_FullFlow(t *testing.T) {
 
 	tags := []Tag{{Name: "Test", Value: "Chunked"}}
 
-	tx, status, err := client.UploadDataChunked(wallet, data, tags)
+	tx, status, err := client.UploadDataChunked(context.Background(), wallet, data, tags)
 	if err != nil {
 		t.Fatalf("UploadDataChunked failed: %v", err)
 	}
@@ -354,7 +355,7 @@ func TestUploadData_AutoChunkedRouting(t *testing.T) {
 		largeData[i] = byte(i % 256)
 	}
 
-	tx, _, err := client.UploadData(wallet, largeData, nil)
+	tx, _, err := client.UploadData(context.Background(), wallet, largeData, nil)
 	if err != nil {
 		t.Fatalf("UploadData with large data failed: %v", err)
 	}
@@ -410,7 +411,7 @@ func TestUploadData_SmallDataOldPath(t *testing.T) {
 	}
 
 	smallData := []byte("hello arweave")
-	tx, _, err := client.UploadData(wallet, smallData, nil)
+	tx, _, err := client.UploadData(context.Background(), wallet, smallData, nil)
 	if err != nil {
 		t.Fatalf("UploadData with small data failed: %v", err)
 	}
@@ -527,7 +528,7 @@ func TestUploadDataChunkedStreamingFile(t *testing.T) {
 	}
 
 	tags := []Tag{{Name: "Test", Value: "Streaming"}}
-	tx, status, err := client.UploadDataChunkedStreamingFile(wallet, tmpFile, int64(len(data)), tags)
+	tx, status, err := client.UploadDataChunkedStreamingFile(context.Background(), wallet, tmpFile, int64(len(data)), tags)
 	if err != nil {
 		t.Fatalf("UploadDataChunkedStreamingFile failed: %v", err)
 	}
@@ -565,7 +566,7 @@ func TestUploadDataChunkedStreaming_WithReaderAt(t *testing.T) {
 
 	reader := bytes.NewReader(data)
 	tags := []Tag{{Name: "Test", Value: "ReaderAt"}}
-	tx, status, err := client.UploadDataChunkedStreaming(wallet, reader, int64(len(data)), tags)
+	tx, status, err := client.UploadDataChunkedStreaming(context.Background(), wallet, reader, int64(len(data)), tags)
 	if err != nil {
 		t.Fatalf("UploadDataChunkedStreaming failed: %v", err)
 	}
@@ -626,7 +627,7 @@ func TestVerifyAllChunks_Success(t *testing.T) {
 	defer server.Close()
 
 	client := NewGatewayClient(server.URL)
-	err := client.verifyAllChunks("test-tx-id", tx, int64(len(data)))
+	err := client.verifyAllChunks(context.Background(), "test-tx-id", tx, int64(len(data)))
 	if err != nil {
 		t.Fatalf("verifyAllChunks should succeed: %v", err)
 	}
@@ -687,7 +688,7 @@ func TestVerifyAllChunks_Corruption(t *testing.T) {
 	defer server.Close()
 
 	client := NewGatewayClient(server.URL)
-	err := client.verifyAllChunks("test-tx-id", tx, int64(len(data)))
+	err := client.verifyAllChunks(context.Background(), "test-tx-id", tx, int64(len(data)))
 	if err == nil {
 		t.Fatal("verifyAllChunks MUST return an error for corrupted data")
 	}
@@ -741,7 +742,7 @@ func TestVerifyAllChunks_EmptyResponse(t *testing.T) {
 	defer server.Close()
 
 	client := NewGatewayClient(server.URL)
-	err := client.verifyAllChunks("test-tx-id", tx, int64(len(data)))
+	err := client.verifyAllChunks(context.Background(), "test-tx-id", tx, int64(len(data)))
 	if err == nil {
 		t.Fatal("verifyAllChunks MUST return an error for empty response")
 	}

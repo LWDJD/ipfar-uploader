@@ -4,6 +4,7 @@ package arweave
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -40,9 +41,15 @@ func isRetryableHTTPError(err error) bool {
 // retryWithBackoff executes fn up to maxRetries+1 times if the error is
 // retryable. Between retries it sleeps for delays[attempt] and prints a
 // message to stderr.
-func retryWithBackoff(fn func() error, maxRetries int, delays []time.Duration) error {
+func retryWithBackoff(ctx context.Context, fn func() error, maxRetries int, delays []time.Duration) error {
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		err := fn()
 		if err == nil {
 			return nil
@@ -54,7 +61,13 @@ func retryWithBackoff(fn func() error, maxRetries int, delays []time.Duration) e
 		if attempt < maxRetries {
 			delay := delays[attempt]
 			fmt.Fprintf(os.Stderr, "Retry %d/%d in %ds...\n", attempt+1, maxRetries, int(delay.Seconds()))
-			time.Sleep(delay)
+
+			// Context-aware sleep
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
 		}
 	}
 	return lastErr
@@ -368,17 +381,19 @@ func (gc *GatewayClient) SetProxy(proxyURL string) error {
 }
 
 // SubmitTransaction sends a signed transaction to the gateway.
-func (gc *GatewayClient) SubmitTransaction(tx *Transaction) (string, error) {
+func (gc *GatewayClient) SubmitTransaction(ctx context.Context, tx *Transaction) (string, error) {
 	body, err := tx.ToJSON()
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := gc.client.Post(
-		gc.GatewayURL+"/tx",
-		"application/json",
-		bytes.NewReader(body),
-	)
+	req, err := http.NewRequestWithContext(ctx, "POST", gc.GatewayURL+"/tx", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := gc.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to submit tx: %w", err)
 	}
@@ -401,8 +416,13 @@ type TransactionStatus struct {
 }
 
 // GetTransactionStatus checks whether a transaction is confirmed.
-func (gc *GatewayClient) GetTransactionStatus(txID string) (*TransactionStatus, error) {
-	resp, err := gc.client.Get(gc.GatewayURL + "/tx/" + txID)
+func (gc *GatewayClient) GetTransactionStatus(ctx context.Context, txID string) (*TransactionStatus, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", gc.GatewayURL+"/tx/"+txID, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := gc.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -433,25 +453,46 @@ func (gc *GatewayClient) GetTransactionStatus(txID string) (*TransactionStatus, 
 }
 
 // WaitForConfirmation polls until the transaction is confirmed.
-func (gc *GatewayClient) WaitForConfirmation(txID string, maxRetries int, interval time.Duration) (*TransactionStatus, error) {
+// The loop respects context cancellation.
+func (gc *GatewayClient) WaitForConfirmation(ctx context.Context, txID string, maxRetries int, interval time.Duration) (*TransactionStatus, error) {
 	for i := 0; i < maxRetries; i++ {
-		status, err := gc.GetTransactionStatus(txID)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		status, err := gc.GetTransactionStatus(ctx, txID)
 		if err != nil {
-			time.Sleep(interval)
+			// Context-aware sleep
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(interval):
+			}
 			continue
 		}
 		if status.Confirmed && status.BlockHeight > 0 {
 			return status, nil
 		}
-		time.Sleep(interval)
+		// Context-aware sleep
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
 	}
 	return nil, fmt.Errorf("transaction %s not confirmed after %d retries", txID, maxRetries)
 }
 
 // GetReward fetches the recommended mining reward for a given data size.
-func (gc *GatewayClient) GetReward(dataSize int64) (string, error) {
+func (gc *GatewayClient) GetReward(ctx context.Context, dataSize int64) (string, error) {
 	u := fmt.Sprintf("%s/price/%d", gc.GatewayURL, dataSize)
-	resp, err := gc.client.Get(u)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	resp, err := gc.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to get price: %w", err)
 	}
@@ -464,8 +505,12 @@ func (gc *GatewayClient) GetReward(dataSize int64) (string, error) {
 }
 
 // GetAnchor gets a recent transaction anchor.
-func (gc *GatewayClient) GetAnchor() (string, error) {
-	resp, err := gc.client.Get(gc.GatewayURL + "/tx_anchor")
+func (gc *GatewayClient) GetAnchor(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", gc.GatewayURL+"/tx_anchor", nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	resp, err := gc.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to get anchor: %w", err)
 	}
@@ -484,9 +529,9 @@ func (gc *GatewayClient) GetAnchor() (string, error) {
 //
 // Transient gateway errors (502, 503, 504) are automatically retried up to
 // 3 times with exponential backoff (1s → 2s → 4s).
-func (gc *GatewayClient) UploadData(wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
+func (gc *GatewayClient) UploadData(ctx context.Context, wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
 	if len(data) >= ChunkSize {
-		return gc.UploadDataChunked(wallet, data, tags)
+		return gc.UploadDataChunked(ctx, wallet, data, tags)
 	}
 
 	var tx *Transaction
@@ -495,13 +540,13 @@ func (gc *GatewayClient) UploadData(wallet *Wallet, data []byte, tags []Tag) (*T
 	const maxRetries = 3
 	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
-	err := retryWithBackoff(func() error {
-		anchor, aErr := gc.GetAnchor()
+	err := retryWithBackoff(ctx, func() error {
+		anchor, aErr := gc.GetAnchor(ctx)
 		if aErr != nil {
 			anchor = ""
 		}
 
-		reward, rErr := gc.GetReward(int64(len(data)))
+		reward, rErr := gc.GetReward(ctx, int64(len(data)))
 		if rErr != nil {
 			reward = "0"
 		}
@@ -517,14 +562,14 @@ func (gc *GatewayClient) UploadData(wallet *Wallet, data []byte, tags []Tag) (*T
 			return fmt.Errorf("failed to sign: %w", sErr)
 		}
 
-		txID, sErr := gc.SubmitTransaction(tx)
+		txID, sErr := gc.SubmitTransaction(ctx, tx)
 		if sErr != nil {
 			return fmt.Errorf("failed to submit: %w", sErr)
 		}
 		tx.ID = txID
 
 		var cErr error
-		status, cErr = gc.WaitForConfirmation(txID, 120, 3*time.Second)
+		status, cErr = gc.WaitForConfirmation(ctx, txID, 120, 3*time.Second)
 		if cErr != nil {
 			return fmt.Errorf("submitted but unconfirmed: %w", cErr)
 		}
@@ -538,12 +583,14 @@ func (gc *GatewayClient) UploadData(wallet *Wallet, data []byte, tags []Tag) (*T
 }
 
 // UploadDataRaw submits an already-signed raw transaction bytes (bundle).
-func (gc *GatewayClient) UploadDataRaw(data []byte) (string, error) {
-	resp, err := gc.client.Post(
-		gc.GatewayURL+"/tx",
-		"application/octet-stream",
-		bytes.NewReader(data),
-	)
+func (gc *GatewayClient) UploadDataRaw(ctx context.Context, data []byte) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", gc.GatewayURL+"/tx", bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := gc.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to submit raw data: %w", err)
 	}
@@ -769,8 +816,8 @@ func bundleItemSignData(item *BundleItem) []byte {
 // height descending so the newest match is returned first.
 //
 // Returns the tx ID if found, or empty string if none exists.
-func (gc *GatewayClient) QueryExistingCAR(rootCID string) (string, error) {
-	ids, err := gc.QueryExistingCARs(rootCID, 1)
+func (gc *GatewayClient) QueryExistingCAR(ctx context.Context, rootCID string) (string, error) {
+	ids, err := gc.QueryExistingCARs(ctx, rootCID, 1)
 	if err != nil {
 		return "", err
 	}
@@ -787,7 +834,7 @@ func (gc *GatewayClient) QueryExistingCAR(rootCID string) (string, error) {
 // (both plain-text and base64url-encoded forms), Protocol = IPFS-Arweave-Bridge
 // (both forms).  The dual-value matching handles both legacy plain-text
 // tags and goar chunked-upload base64url-encoded tags.
-func (gc *GatewayClient) QueryExistingCARs(rootCID string, limit int) ([]string, error) {
+func (gc *GatewayClient) QueryExistingCARs(ctx context.Context, rootCID string, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 5
 	}
@@ -820,7 +867,13 @@ func (gc *GatewayClient) QueryExistingCARs(rootCID string, limit int) ([]string,
 		return nil, fmt.Errorf("failed to marshal GraphQL query: %w", err)
 	}
 
-	resp, err := gc.client.Post(graphqlURL, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", graphqlURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("GraphQL query failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := gc.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("GraphQL query failed: %w", err)
 	}
@@ -857,9 +910,9 @@ func (gc *GatewayClient) QueryExistingCARs(rootCID string, limit int) ([]string,
 
 // DownloadTransactionDataRange downloads a byte range of a transaction's data.
 // start and end are inclusive. Use -1 for end to download to EOF.
-func (gc *GatewayClient) DownloadTransactionDataRange(txID string, start, end int64) ([]byte, error) {
+func (gc *GatewayClient) DownloadTransactionDataRange(ctx context.Context, txID string, start, end int64) ([]byte, error) {
 	url := gc.GatewayURL + "/" + txID
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -884,12 +937,12 @@ func (gc *GatewayClient) DownloadTransactionDataRange(txID string, start, end in
 }
 
 // DownloadTransactionData downloads the full transaction data.
-func (gc *GatewayClient) DownloadTransactionData(txID string) ([]byte, error) {
-	return gc.DownloadTransactionDataRange(txID, 0, -1)
+func (gc *GatewayClient) DownloadTransactionData(ctx context.Context, txID string) ([]byte, error) {
+	return gc.DownloadTransactionDataRange(ctx, txID, 0, -1)
 }
 
 // UploadBundle creates and uploads an ANS-104 bundle transaction.
-func (gc *GatewayClient) UploadBundle(wallet *Wallet, items []*BundleItem, tags []Tag) (*Transaction, *TransactionStatus, error) {
+func (gc *GatewayClient) UploadBundle(ctx context.Context, wallet *Wallet, items []*BundleItem, tags []Tag) (*Transaction, *TransactionStatus, error) {
 	bb := NewBundleBuilder()
 	for _, item := range items {
 		bb.AddItem(*item)
@@ -901,5 +954,5 @@ func (gc *GatewayClient) UploadBundle(wallet *Wallet, items []*BundleItem, tags 
 	}
 
 	// The bundle itself is uploaded as a data transaction
-	return gc.UploadData(wallet, bundleBytes, tags)
+	return gc.UploadData(ctx, wallet, bundleBytes, tags)
 }

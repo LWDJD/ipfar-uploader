@@ -115,7 +115,7 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 
 	// ── Dedup: check GraphQL for existing CAR ─────────────────────────
 	if state.ShouldAttemptDedup() {
-		u.dedupCheckCAR(result, state)
+		u.dedupCheckCAR(ctx, result, state)
 	}
 
 	// ── Check if already complete ─────────────────────────────────────
@@ -228,12 +228,12 @@ func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult,
 	// Build, sign and submit the transaction
 	fmt.Printf("   Uploading CAR file (%d bytes)...\n", len(carBytes))
 
-	anchor, err := u.cfg.Gateway.GetAnchor()
+	anchor, err := u.cfg.Gateway.GetAnchor(ctx)
 	if err != nil {
 		anchor = ""
 	}
 
-	reward, err := u.cfg.Gateway.GetReward(int64(len(carBytes)))
+	reward, err := u.cfg.Gateway.GetReward(ctx, int64(len(carBytes)))
 	if err != nil {
 		reward = "0"
 	}
@@ -251,7 +251,7 @@ func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult,
 		return stateError(state)
 	}
 
-	txID, err := u.cfg.Gateway.SubmitTransaction(tx)
+	txID, err := u.cfg.Gateway.SubmitTransaction(ctx, tx)
 	if err != nil {
 		state.SetError(fmt.Errorf("failed to submit CAR tx: %w", err))
 		state.Save()
@@ -267,7 +267,7 @@ func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult,
 	fmt.Printf("   CAR submitted: %s\n", txID)
 
 	// Wait for confirmation
-	status, err := u.cfg.Gateway.WaitForConfirmation(txID, 120, 3*time.Second)
+	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, txID, 120, 3*time.Second)
 	if err != nil {
 		// Don't mark as error — allow resume
 		fmt.Printf("   Warning: CAR confirmation wait failed: %v\n", err)
@@ -301,7 +301,7 @@ func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult,
 func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult, carBytes []byte, state *UploadState, cachePath string, arTags []arweave.Tag) error {
 	fmt.Printf("   Uploading CAR file via chunked upload (%d bytes)...\n", len(carBytes))
 
-	tx, status, err := u.cfg.Gateway.UploadDataChunked(u.cfg.Wallet, carBytes, arTags)
+	tx, status, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, carBytes, arTags)
 	if err != nil {
 		state.SetError(fmt.Errorf("chunked CAR upload failed: %w", err))
 		state.Save()
@@ -453,7 +453,7 @@ func (u *Uploader) submitBundleData(ctx context.Context, bundleData []byte) (str
 		fmt.Printf("   Uploading bundle via chunked upload (%d bytes)...\n", len(bundleData))
 		// Use empty tags for the bundle transaction itself; the bundle
 		// items carry their own tags internally.
-		tx, status, err := u.cfg.Gateway.UploadDataChunked(u.cfg.Wallet, bundleData, nil)
+		tx, status, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, bundleData, nil)
 		if err != nil {
 			return "", 0, err
 		}
@@ -461,13 +461,13 @@ func (u *Uploader) submitBundleData(ctx context.Context, bundleData []byte) (str
 	}
 
 	fmt.Printf("   Uploading bundle (2 items, %d bytes)...\n", len(bundleData))
-	txID, err := u.cfg.Gateway.UploadDataRaw(bundleData)
+	txID, err := u.cfg.Gateway.UploadDataRaw(ctx, bundleData)
 	if err != nil {
 		return "", 0, err
 	}
 
 	fmt.Printf("   Bundle submitted: %s\n", txID)
-	status, err := u.cfg.Gateway.WaitForConfirmation(txID, 120, 3*time.Second)
+	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, txID, 120, 3*time.Second)
 	if err != nil {
 		return txID, 0, fmt.Errorf("bundle confirmation timeout (txid saved for resume): %w", err)
 	}
@@ -518,11 +518,11 @@ func (u *Uploader) uploadMetaWithState(ctx context.Context, result *UploadResult
 	// Build, sign, submit
 	fmt.Printf("   Uploading metadata...\n")
 
-	anchor, err := u.cfg.Gateway.GetAnchor()
+	anchor, err := u.cfg.Gateway.GetAnchor(ctx)
 	if err != nil {
 		anchor = ""
 	}
-	reward, err := u.cfg.Gateway.GetReward(int64(len(metaBase64)))
+	reward, err := u.cfg.Gateway.GetReward(ctx, int64(len(metaBase64)))
 	if err != nil {
 		reward = "0"
 	}
@@ -540,7 +540,7 @@ func (u *Uploader) uploadMetaWithState(ctx context.Context, result *UploadResult
 		return stateError(state)
 	}
 
-	metaTXID, err := u.cfg.Gateway.SubmitTransaction(tx)
+	metaTXID, err := u.cfg.Gateway.SubmitTransaction(ctx, tx)
 	if err != nil {
 		state.SetError(fmt.Errorf("failed to submit meta tx: %w", err))
 		state.Save()
@@ -555,7 +555,7 @@ func (u *Uploader) uploadMetaWithState(ctx context.Context, result *UploadResult
 	fmt.Printf("   Metadata submitted: %s\n", metaTXID)
 
 	// Wait for confirmation
-	status, err := u.cfg.Gateway.WaitForConfirmation(metaTXID, 120, 3*time.Second)
+	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, metaTXID, 120, 3*time.Second)
 	if err != nil {
 		fmt.Printf("   Warning: Metadata confirmation wait failed: %v\n", err)
 		state.SetError(fmt.Errorf("meta confirmation timeout: %w", err))
@@ -585,7 +585,7 @@ func (u *Uploader) uploadMetaWithState(ctx context.Context, result *UploadResult
 func (u *Uploader) handleCarResume(ctx context.Context, state *UploadState) {
 	fmt.Printf("   Resuming: checking CAR tx %s...\n", state.CarTXID)
 
-	status, err := u.cfg.Gateway.GetTransactionStatus(state.CarTXID)
+	status, err := u.cfg.Gateway.GetTransactionStatus(ctx, state.CarTXID)
 	if err != nil {
 		fmt.Printf("   Warning: failed to check CAR tx status: %v\n", err)
 		// If we can't check, see if we should resubmit
@@ -627,7 +627,7 @@ func (u *Uploader) handleCarResume(ctx context.Context, state *UploadState) {
 	} else if state.ShouldWaitForCAR() {
 		fmt.Printf("   CAR tx not yet confirmed, continuing to wait...\n")
 		// Block and wait for confirmation
-		status, err := u.cfg.Gateway.WaitForConfirmation(state.CarTXID, 120, 3*time.Second)
+		status, err := u.cfg.Gateway.WaitForConfirmation(ctx, state.CarTXID, 120, 3*time.Second)
 		if err != nil {
 			fmt.Printf("   Warning: CAR confirmation wait failed: %v\n", err)
 			state.SetError(fmt.Errorf("CAR confirmation timeout on resume: %w", err))
@@ -807,7 +807,7 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 	}
 
 	fmt.Printf("   Uploading CAR file (%d bytes)...\n", len(carBytes))
-	dataTX, dataStatus, err := u.cfg.Gateway.UploadData(u.cfg.Wallet, carBytes, arTags)
+	dataTX, dataStatus, err := u.cfg.Gateway.UploadData(ctx, u.cfg.Wallet, carBytes, arTags)
 	if err != nil {
 		result.Error = fmt.Errorf("CAR upload failed: %w", err)
 		return result, result.Error
@@ -898,14 +898,14 @@ func (u *Uploader) uploadBundle(ctx context.Context, result *UploadResult, carBy
 	}
 
 	fmt.Printf("   Uploading bundle (2 items, %d bytes)...\n", len(bundleData))
-	bundleTXID, err := u.cfg.Gateway.UploadDataRaw(bundleData)
+	bundleTXID, err := u.cfg.Gateway.UploadDataRaw(ctx, bundleData)
 	if err != nil {
 		result.Error = fmt.Errorf("bundle upload failed: %w", err)
 		return result, result.Error
 	}
 	fmt.Printf("   Bundle uploaded: %s\n", bundleTXID)
 
-	status, err := u.cfg.Gateway.WaitForConfirmation(bundleTXID, 120, 3*time.Second)
+	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, bundleTXID, 120, 3*time.Second)
 	if err != nil {
 		fmt.Printf("   Warning: bundle confirmation check failed: %v\n", err)
 	} else {
@@ -937,7 +937,7 @@ func (u *Uploader) uploadCrossBundle(ctx context.Context, result *UploadResult, 
 		result.Error = fmt.Errorf("failed to build bundle: %w", err)
 		return result, result.Error
 	}
-	bundleTXID, err := u.cfg.Gateway.UploadDataRaw(bundleData)
+	bundleTXID, err := u.cfg.Gateway.UploadDataRaw(ctx, bundleData)
 	if err != nil {
 		result.Error = fmt.Errorf("bundle upload failed: %w", err)
 		return result, result.Error
@@ -945,7 +945,7 @@ func (u *Uploader) uploadCrossBundle(ctx context.Context, result *UploadResult, 
 	result.BundleTXID = bundleTXID
 	fmt.Printf("   CAR bundle uploaded: bundle_tx=%s, item=%s\n", bundleTXID, carItemID)
 
-	status, err := u.cfg.Gateway.WaitForConfirmation(bundleTXID, 120, 3*time.Second)
+	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, bundleTXID, 120, 3*time.Second)
 	if err != nil {
 		result.Error = fmt.Errorf("bundle confirmation failed: %w", err)
 		return result, result.Error
@@ -994,7 +994,7 @@ func (u *Uploader) uploadMetadata(ctx context.Context, result *UploadResult) err
 
 	metaTags := metadata.BuildMetaTags(result.RootCID, result.DataTXID)
 	fmt.Printf("   Uploading metadata...\n")
-	metaTX, _, err := u.cfg.Gateway.UploadData(u.cfg.Wallet, []byte(metaBase64), toArweaveTags(metaTags))
+	metaTX, _, err := u.cfg.Gateway.UploadData(ctx, u.cfg.Wallet, []byte(metaBase64), toArweaveTags(metaTags))
 	if err != nil {
 		return fmt.Errorf("metadata upload failed: %w", err)
 	}
@@ -1116,15 +1116,15 @@ func effectivePoWWorkers(cfgWorkers int) int {
 // the state is updated to reuse it.  If candidates exist but none pass
 // verification the file is marked as skipped (car_confirmed with empty
 // txid) so we don't waste AR on a duplicate upload.
-func (u *Uploader) dedupCheckCAR(result *UploadResult, state *UploadState) {
-	candidates := u.queryExistingCARsWithRetry(result.RootCID)
+func (u *Uploader) dedupCheckCAR(ctx context.Context, result *UploadResult, state *UploadState) {
+	candidates := u.queryExistingCARsWithRetry(ctx, result.RootCID)
 	if len(candidates) == 0 {
 		return
 	}
 
 	for _, txID := range candidates {
 		fmt.Printf("   Found candidate CAR on chain: %s\n", txID)
-		verified, verifyErr := VerifyRemoteCAR(u.cfg.Gateway, txID, result.RootCID)
+		verified, verifyErr := VerifyRemoteCAR(ctx, u.cfg.Gateway, txID, result.RootCID)
 		if verifyErr == nil && verified {
 			fmt.Printf("   CAR verified, reusing existing transaction\n")
 			state.CarTXID = txID
@@ -1152,18 +1152,23 @@ func (u *Uploader) dedupCheckCAR(result *UploadResult, state *UploadState) {
 // queryExistingCARsWithRetry queries GraphQL for existing CAR transactions
 // matching the given rootCID. Retries up to 3 times with exponential backoff
 // on network errors. Returns up to 5 candidate tx IDs (empty if none found).
-func (u *Uploader) queryExistingCARsWithRetry(rootCID string) []string {
+func (u *Uploader) queryExistingCARsWithRetry(ctx context.Context, rootCID string) []string {
 	maxRetries := 3
 	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
 	for i := 0; i < maxRetries; i++ {
-		ids, err := u.cfg.Gateway.QueryExistingCARs(rootCID, 5)
+		ids, err := u.cfg.Gateway.QueryExistingCARs(ctx, rootCID, 5)
 		if err == nil {
 			return ids
 		}
 		if i < maxRetries-1 {
 			fmt.Printf("   Warning: GraphQL dedup check failed (attempt %d/%d): %v\n", i+1, maxRetries, err)
-			time.Sleep(delays[i])
+			// Context-aware sleep
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(delays[i]):
+			}
 		}
 	}
 
