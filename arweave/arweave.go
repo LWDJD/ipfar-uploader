@@ -820,6 +820,39 @@ func (gc *GatewayClient) QueryExistingCAR(rootCID string) (string, error) {
 	return "", nil
 }
 
+// DownloadTransactionDataRange downloads a byte range of a transaction's data.
+// start and end are inclusive. Use -1 for end to download to EOF.
+func (gc *GatewayClient) DownloadTransactionDataRange(txID string, start, end int64) ([]byte, error) {
+	url := gc.GatewayURL + "/" + txID
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	if end < 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", start))
+	} else {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	}
+
+	resp, err := gc.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download data: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return nil, fmt.Errorf("gateway returned %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+// DownloadTransactionData downloads the full transaction data.
+func (gc *GatewayClient) DownloadTransactionData(txID string) ([]byte, error) {
+	return gc.DownloadTransactionDataRange(txID, 0, -1)
+}
+
 // UploadBundle creates and uploads an ANS-104 bundle transaction.
 func (gc *GatewayClient) UploadBundle(wallet *Wallet, items []*BundleItem, tags []Tag) (*Transaction, *TransactionStatus, error) {
 	bb := NewBundleBuilder()

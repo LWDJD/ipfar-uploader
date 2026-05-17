@@ -120,14 +120,25 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 			fmt.Printf("   Warning: GraphQL dedup check failed: %v\n", gqlErr)
 		} else if existingTX != "" {
 			fmt.Printf("   Found existing CAR on chain: %s\n", existingTX)
-			state.CarTXID = existingTX
-			state.CarConfirmed = true
-			state.CarHeight = 0 // unknown, but confirmed
-			if err := state.TransitionTo(StatusCarConfirmed); err != nil {
-				state.Status = StatusCarConfirmed
-			}
-			if saveErr := state.Save(); saveErr != nil {
-				fmt.Printf("   Warning: failed to save state: %v\n", saveErr)
+			// Secondary verification: download key portions and validate CAR integrity.
+			if verified, verifyErr := VerifyRemoteCAR(u.cfg.Gateway, existingTX, result.RootCID); verifyErr != nil || !verified {
+				reason := "unknown"
+				if verifyErr != nil {
+					reason = verifyErr.Error()
+				}
+				fmt.Printf("   Warning: Found existing CAR but verification failed: %s\n", reason)
+				// Ignore the on-chain record and proceed with normal upload.
+			} else {
+				fmt.Printf("   CAR verified, reusing existing transaction\n")
+				state.CarTXID = existingTX
+				state.CarConfirmed = true
+				state.CarHeight = 0 // unknown, but confirmed
+				if err := state.TransitionTo(StatusCarConfirmed); err != nil {
+					state.Status = StatusCarConfirmed
+				}
+				if saveErr := state.Save(); saveErr != nil {
+					fmt.Printf("   Warning: failed to save state: %v\n", saveErr)
+				}
 			}
 		}
 	}
