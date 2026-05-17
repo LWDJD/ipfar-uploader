@@ -759,6 +759,67 @@ func bundleItemSignData(item *BundleItem) []byte {
 	return deepHashChunks(chunks)
 }
 
+// =============================================================================
+// GraphQL helpers
+// =============================================================================
+
+// QueryExistingCAR queries the Arweave GraphQL endpoint for an existing CAR
+// transaction tagged with the given rootCID. Returns the tx ID if found, or
+// empty string if none exists.
+func (gc *GatewayClient) QueryExistingCAR(rootCID string) (string, error) {
+	query := fmt.Sprintf(`{
+		transactions(
+			tags: [
+				{ name: "Root-CID", values: ["%s"] },
+				{ name: "Content-Type", values: ["application/vnd.ipld.car"] }
+			],
+			first: 1
+		) {
+			edges {
+				node { id }
+			}
+		}
+	}`, rootCID)
+
+	graphqlURL := gc.GatewayURL + "/graphql"
+	payload := map[string]string{"query": query}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal GraphQL query: %w", err)
+	}
+
+	resp, err := gc.client.Post(graphqlURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("GraphQL query failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GraphQL returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var gqlResp struct {
+		Data struct {
+			Transactions struct {
+				Edges []struct {
+					Node struct {
+						ID string `json:"id"`
+					} `json:"node"`
+				} `json:"edges"`
+			} `json:"transactions"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &gqlResp); err != nil {
+		return "", fmt.Errorf("failed to parse GraphQL response: %w", err)
+	}
+
+	if len(gqlResp.Data.Transactions.Edges) > 0 {
+		return gqlResp.Data.Transactions.Edges[0].Node.ID, nil
+	}
+	return "", nil
+}
+
 // UploadBundle creates and uploads an ANS-104 bundle transaction.
 func (gc *GatewayClient) UploadBundle(wallet *Wallet, items []*BundleItem, tags []Tag) (*Transaction, *TransactionStatus, error) {
 	bb := NewBundleBuilder()
