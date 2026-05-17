@@ -420,6 +420,42 @@ func TestNewUploadState(t *testing.T) {
 }
 
 // =============================================================================
+// ShouldAttemptDedup tests
+// =============================================================================
+
+func TestShouldAttemptDedup(t *testing.T) {
+	tests := []struct {
+		name   string
+		status UploadStatus
+		carTXID string
+		want   bool
+	}{
+		{"pending with empty txid", StatusPending, "", true},
+		{"pending with txid (shouldn't happen)", StatusPending, "tx123", true},
+		{"car_uploading with empty txid", StatusCarUploading, "", true},
+		{"car_uploading with txid (shouldn't happen)", StatusCarUploading, "tx123", true},
+		{"car_submitted with empty txid", StatusCarSubmitted, "", true},
+		{"car_submitted with txid", StatusCarSubmitted, "tx123", false},
+		{"car_confirmed with empty txid", StatusCarConfirmed, "", true},
+		{"car_confirmed with txid", StatusCarConfirmed, "tx123", false},
+		{"meta_uploading with txid", StatusMetaUploading, "tx123", false},
+		{"meta_submitted with txid", StatusMetaSubmitted, "tx123", false},
+		{"meta_confirmed with txid", StatusMetaConfirmed, "tx123", false},
+		{"done with txid", StatusDone, "tx123", false},
+		{"done with empty txid", StatusDone, "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &UploadState{Status: tt.status, CarTXID: tt.carTXID}
+			if got := s.ShouldAttemptDedup(); got != tt.want {
+				t.Errorf("ShouldAttemptDedup() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// =============================================================================
 // SetError tests
 // =============================================================================
 

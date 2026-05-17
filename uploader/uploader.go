@@ -114,11 +114,9 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 	}
 
 	// ── Dedup: check GraphQL for existing CAR ─────────────────────────
-	if state.NeedsCARUpload() {
-		existingTX, gqlErr := u.cfg.Gateway.QueryExistingCAR(result.RootCID)
-		if gqlErr != nil {
-			fmt.Printf("   Warning: GraphQL dedup check failed: %v\n", gqlErr)
-		} else if existingTX != "" {
+	if state.ShouldAttemptDedup() {
+		existingTX := u.queryExistingCARWithRetry(result.RootCID)
+		if existingTX != "" {
 			fmt.Printf("   Found existing CAR on chain: %s\n", existingTX)
 			// Secondary verification: download key portions and validate CAR integrity.
 			if verified, verifyErr := VerifyRemoteCAR(u.cfg.Gateway, existingTX, result.RootCID); verifyErr != nil || !verified {
@@ -1075,6 +1073,29 @@ func effectivePoWWorkers(cfgWorkers int) int {
 		return cfgWorkers
 	}
 	return pow.DefaultWorkers()
+}
+
+// queryExistingCARWithRetry attempts to query GraphQL for an existing CAR
+// transaction. Retries up to 3 times with exponential backoff (1s → 2s → 4s)
+// on network errors. Returns the existing tx ID (empty if none found) or an
+// empty string after all retries are exhausted.
+func (u *Uploader) queryExistingCARWithRetry(rootCID string) string {
+	maxRetries := 3
+	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+
+	for i := 0; i < maxRetries; i++ {
+		existingTX, err := u.cfg.Gateway.QueryExistingCAR(rootCID)
+		if err == nil {
+			return existingTX
+		}
+		if i < maxRetries-1 {
+			fmt.Printf("   Warning: GraphQL dedup check failed (attempt %d/%d): %v\n", i+1, maxRetries, err)
+			time.Sleep(delays[i])
+		}
+	}
+
+	fmt.Printf("   Warning: cannot query chain for dedup, continuing with fresh upload\n")
+	return ""
 }
 
 // stateError formats the last error from state.

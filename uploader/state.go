@@ -300,6 +300,27 @@ func ComputeFileHash(filePath string) (string, error) {
 	return fmt.Sprintf("%x", h[:]), nil
 }
 
+// =============================================================================
+// Dedup gating
+// =============================================================================
+
+// ShouldAttemptDedup returns true when the uploader should query GraphQL
+// to check for an existing CAR transaction on chain.
+//
+// Rules:
+//   - Always attempt dedup when status is pending or car_uploading
+//     (the earliest phases, before any tx is known).
+//   - If CarTXID is already known (non-empty), skip dedup — we already
+//     have a transaction to track.
+//   - If CarTXID is empty, attempt dedup — we might find an existing
+//     upload from a previous (possibly failed) run or from another uploader.
+func (s *UploadState) ShouldAttemptDedup() bool {
+	if s.Status == StatusPending || s.Status == StatusCarUploading {
+		return true
+	}
+	return s.CarTXID == ""
+}
+
 // GraphQL dedup query is implemented in arweave.GatewayClient.QueryExistingCAR.
 // The state package only manages local state files; network queries are done
 // by the uploader using the gateway client.
