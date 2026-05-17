@@ -358,3 +358,182 @@ func encodeVarint(v uint64) []byte {
 	buf = append(buf, byte(v))
 	return buf
 }
+
+// =============================================================================
+// Tests for getRemoteFileSize fallback strategies
+// =============================================================================
+
+// newMockGatewayForSize starts a server whose "/" handler can be
+// customised via the supplied handler function.  Returns the client,
+// a txID and a cleanup.
+func newMockGatewayForSize(t *testing.T, handler http.HandlerFunc) (*arweave.GatewayClient, string, func()) {
+	t.Helper()
+
+	server := httptest.NewServer(handler)
+	client := arweave.NewGatewayClient(server.URL)
+	txID := "mock-tx-id"
+	cleanup := func() { server.Close() }
+	return client, txID, cleanup
+}
+
+// TestGetRemoteFileSize_HeadWorks verifies the happy path (strategy 1).
+func TestGetRemoteFileSize_HeadWorks(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "12345")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+	gateway, txID, cleanup := newMockGatewayForSize(t, handler)
+	defer cleanup()
+
+	size, err := getRemoteFileSize(context.Background(), gateway, txID)
+	if err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if size != 12345 {
+		t.Fatalf("expected size=12345, got %d", size)
+	}
+}
+
+// TestGetRemoteFileSize_HeadNoContentLength_FallsBackToRange verifies
+// that when HEAD returns no Content-Length we fall back to the Range
+// strategy (strategy 2).
+func TestGetRemoteFileSize_HeadNoContentLength_FallsBackToRange(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			// Simulate CDN that doesn't give Content-Length
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodGet && r.Header.Get("Range") == "bytes=0-0" {
+			w.Header().Set("Content-Range", "bytes 0-0/99999")
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write([]byte{0x00})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+	gateway, txID, cleanup := newMockGatewayForSize(t, handler)
+	defer cleanup()
+
+	size, err := getRemoteFileSize(context.Background(), gateway, txID)
+	if err != nil {
+		t.Fatalf("expected success via Range fallback, got: %v", err)
+	}
+	if size != 99999 {
+		t.Fatalf("expected size=99999, got %d", size)
+	}
+}
+
+// TestGetRemoteFileSize_FallsBackToGet verifies strategy 3 (limited GET)
+// when both HEAD and Range strategies fail.
+func TestGetRemoteFileSize_FallsBackToGet(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodGet && r.Header.Get("Range") != "" {
+			// Range also fails — return 200 without Content-Range
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte{0x00})
+			return
+		}
+		if r.Method == http.MethodGet {
+			// Strategy 3: full GET with Content-Length
+			w.Header().Set("Content-Length", "2048")
+			w.WriteHeader(http.StatusOK)
+			// Write partial body (but server already told us the size via header)
+			w.Write(make([]byte, 2048))
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+	gateway, txID, cleanup := newMockGatewayForSize(t, handler)
+	defer cleanup()
+
+	size, err := getRemoteFileSize(context.Background(), gateway, txID)
+	if err != nil {
+		t.Fatalf("expected success via GET fallback, got: %v", err)
+	}
+	if size != 2048 {
+		t.Fatalf("expected size=2048, got %d", size)
+	}
+}
+
+// TestGetRemoteFileSize_AllFail verifies the error path.
+func TestGetRemoteFileSize_AllFail(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodGet && r.Header.Get("Range") != "" {
+			w.WriteHeader(http.StatusOK) // no Content-Range
+			return
+		}
+		if r.Method == http.MethodGet {
+			// No Content-Length header; write > 4 KiB so limited read can't
+			// reach EOF and the strategy fails.
+			w.Header().Del("Content-Length")
+			w.WriteHeader(http.StatusOK)
+			w.Write(make([]byte, 5*1024)) // 5 KiB > 4 KiB limit
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+	gateway, txID, cleanup := newMockGatewayForSize(t, handler)
+	defer cleanup()
+
+	_, err := getRemoteFileSize(context.Background(), gateway, txID)
+	if err == nil {
+		t.Fatal("expected error when all strategies fail")
+	}
+	t.Logf("correctly failed: %v", err)
+}
+
+// TestGetRemoteFileSize_RangeWithUnknownTotal verifies that a Range
+// response with "bytes 0-0/*" (unknown total) is treated as failure
+// and falls through to the next strategy.
+func TestGetRemoteFileSize_RangeUnknownTotal_FallsBackToGet(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodGet && r.Header.Get("Range") == "bytes=0-0" {
+			// Content-Range with unknown total (*)
+			w.Header().Set("Content-Range", "bytes 0-0/*")
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write([]byte{0x00})
+			return
+		}
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Length", "512")
+			w.WriteHeader(http.StatusOK)
+			w.Write(make([]byte, 512))
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+	gateway, txID, cleanup := newMockGatewayForSize(t, handler)
+	defer cleanup()
+
+	size, err := getRemoteFileSize(context.Background(), gateway, txID)
+	if err != nil {
+		t.Fatalf("expected success via GET fallback after Range with *, got: %v", err)
+	}
+	if size != 512 {
+		t.Fatalf("expected size=512, got %d", size)
+	}
+}

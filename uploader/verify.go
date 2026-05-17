@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/LWDJD/ipfar-uploader/arweave"
 	sdkcar "github.com/LWDJD/ipfar-sdk/verify/ipfs"
@@ -56,31 +58,145 @@ func (r *remoteCarReader) ReadAt(p []byte, off int64) (n int, err error) {
 }
 
 // getRemoteFileSize fetches the total byte size of a remote transaction's
-// data via a HEAD request to the Arweave gateway.  Returns 0 and an error
-// when the gateway does not expose a Content-Length header.
+// data from an Arweave gateway.  Several strategies are tried in order
+// because some CDN frontends (most notably arweave.net) do not return
+// Content-Length on HEAD requests against the /raw/ path.
+//
+// Strategies (tried in order):
+//  1. HEAD /{txID}                       – read Content-Length
+//  2. GET  /{txID}  Range: bytes=0-0     – parse Content-Range
+//  3. GET  /{txID}  (limited to 4 KiB)   – read Content-Length or drain body
 func getRemoteFileSize(ctx context.Context, gateway *arweave.GatewayClient, txID string) (int64, error) {
 	url := gateway.GatewayURL + "/" + txID
 
+	// ── Strategy 1: HEAD ──────────────────────────────────────────────
+	if size, err := headFileSize(ctx, url); err == nil {
+		return size, nil
+	}
+
+	// ── Strategy 2: Range bytes=0-0 ───────────────────────────────────
+	if size, err := rangeFileSize(ctx, url); err == nil {
+		return size, nil
+	}
+
+	// ── Strategy 3: limited GET ───────────────────────────────────────
+	if size, err := limitedGetFileSize(ctx, url); err == nil {
+		return size, nil
+	}
+
+	return 0, fmt.Errorf("all strategies exhausted to get file size for %s", txID)
+}
+
+// headFileSize tries a HEAD request and returns Content-Length.
+func headFileSize(ctx context.Context, url string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to create HEAD request: %w", err)
+		return 0, fmt.Errorf("HEAD: %w", err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("HEAD request failed: %w", err)
+		return 0, fmt.Errorf("HEAD: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("HEAD %s returned %d", url, resp.StatusCode)
+		return 0, fmt.Errorf("HEAD returned %d", resp.StatusCode)
 	}
 
 	if resp.ContentLength <= 0 {
-		return 0, fmt.Errorf("gateway did not provide Content-Length for %s", txID)
+		return 0, fmt.Errorf("HEAD: no Content-Length")
 	}
 
 	return resp.ContentLength, nil
+}
+
+// rangeFileSize sends GET with Range: bytes=0-0 and parses the
+// Content-Range response header (format: "bytes 0-0/1048746").
+func rangeFileSize(ctx context.Context, url string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("Range: %w", err)
+	}
+	req.Header.Set("Range", "bytes=0-0")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("Range: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Accept both 206 Partial Content and 200 OK (some servers ignore Range)
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("Range returned %d", resp.StatusCode)
+	}
+
+	cr := resp.Header.Get("Content-Range")
+	if cr == "" {
+		return 0, fmt.Errorf("Range: no Content-Range header")
+	}
+
+	// Content-Range format: "bytes start-end/total" or "bytes start-end/*"
+	slash := strings.LastIndexByte(cr, '/')
+	if slash < 0 {
+		return 0, fmt.Errorf("Range: malformed Content-Range %q", cr)
+	}
+	totalStr := cr[slash+1:]
+	if totalStr == "*" {
+		return 0, fmt.Errorf("Range: Content-Range has unknown total")
+	}
+
+	total, err := strconv.ParseInt(totalStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("Range: invalid Content-Range total %q: %w", totalStr, err)
+	}
+	if total <= 0 {
+		return 0, fmt.Errorf("Range: Content-Range total <= 0 (%d)", total)
+	}
+
+	return total, nil
+}
+
+// limitedGetFileSize issues a GET and reads at most 4 KiB from the body.
+// It first checks Content-Length; if missing, it uses io.LimitReader to
+// read up to 4 KiB.  If EOF is reached within the limit, the file size
+// is known exactly (totalBytesRead); otherwise we cannot determine the
+// size without downloading the whole file.
+func limitedGetFileSize(ctx context.Context, url string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("GET: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("GET: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("GET returned %d", resp.StatusCode)
+	}
+
+	// If the server gave us Content-Length, use it.
+	if resp.ContentLength > 0 {
+		return resp.ContentLength, nil
+	}
+
+	// Drain up to 4 KiB to see if the file is small enough to fully read.
+	const maxRead = 4 * 1024
+	limited := io.LimitReader(resp.Body, maxRead+1) // +1 to detect overflow
+	n, readErr := io.Copy(io.Discard, limited)
+	if readErr != nil {
+		return 0, fmt.Errorf("GET: read error: %w", readErr)
+	}
+
+	if n <= maxRead {
+		// Reached EOF within the limit — we read the entire file.
+		return n, nil
+	}
+
+	return 0, fmt.Errorf("GET: no Content-Length and file larger than %d bytes", maxRead)
 }
 
 // VerifyRemoteCAR downloads key portions of a remote CAR file from Arweave
