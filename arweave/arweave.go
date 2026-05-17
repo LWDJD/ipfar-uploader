@@ -764,39 +764,71 @@ func bundleItemSignData(item *BundleItem) []byte {
 // =============================================================================
 
 // QueryExistingCAR queries the Arweave GraphQL endpoint for an existing CAR
-// transaction tagged with the given rootCID. Returns the tx ID if found, or
-// empty string if none exists.
+// transaction tagged with the given rootCID, Protocol "IPFS-Arweave-Bridge",
+// and Content-Type "application/vnd.ipld.car".  Results are sorted by block
+// height descending so the newest match is returned first.
+//
+// Returns the tx ID if found, or empty string if none exists.
 func (gc *GatewayClient) QueryExistingCAR(rootCID string) (string, error) {
+	ids, err := gc.QueryExistingCARs(rootCID, 1)
+	if err != nil {
+		return "", err
+	}
+	if len(ids) > 0 {
+		return ids[0], nil
+	}
+	return "", nil
+}
+
+// QueryExistingCARs returns up to limit matching transaction IDs for the
+// given Root-CID, ordered by block height descending (newest first).
+//
+// Filters: Root-CID exact match, Content-Type = application/vnd.ipld.car
+// (both plain-text and base64url-encoded forms), Protocol = IPFS-Arweave-Bridge
+// (both forms).  The dual-value matching handles both legacy plain-text
+// tags and goar chunked-upload base64url-encoded tags.
+func (gc *GatewayClient) QueryExistingCARs(rootCID string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+
+	// Base64url-encoded forms of the tag values (for chunked-upload
+	// transactions where goar stores tags encoded).
+	protocolB64 := base64.RawURLEncoding.EncodeToString([]byte("IPFS-Arweave-Bridge"))
+	contentTypeB64 := base64.RawURLEncoding.EncodeToString([]byte("application/vnd.ipld.car"))
+
 	query := fmt.Sprintf(`{
 		transactions(
 			tags: [
 				{ name: "Root-CID", values: ["%s"] },
-				{ name: "Content-Type", values: ["application/vnd.ipld.car"] }
+				{ name: "Content-Type", values: ["application/vnd.ipld.car", "%s"] },
+				{ name: "Protocol", values: ["IPFS-Arweave-Bridge", "%s"] }
 			],
-			first: 1
+			first: %d,
+			sort: HEIGHT_DESC
 		) {
 			edges {
 				node { id }
 			}
 		}
-	}`, rootCID)
+	}`, rootCID, contentTypeB64, protocolB64, limit)
 
 	graphqlURL := gc.GatewayURL + "/graphql"
 	payload := map[string]string{"query": query}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal GraphQL query: %w", err)
+		return nil, fmt.Errorf("failed to marshal GraphQL query: %w", err)
 	}
 
 	resp, err := gc.client.Post(graphqlURL, "application/json", bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("GraphQL query failed: %w", err)
+		return nil, fmt.Errorf("GraphQL query failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("GraphQL returned %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("GraphQL returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var gqlResp struct {
@@ -811,13 +843,16 @@ func (gc *GatewayClient) QueryExistingCAR(rootCID string) (string, error) {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(respBody, &gqlResp); err != nil {
-		return "", fmt.Errorf("failed to parse GraphQL response: %w", err)
+		return nil, fmt.Errorf("failed to parse GraphQL response: %w", err)
 	}
 
-	if len(gqlResp.Data.Transactions.Edges) > 0 {
-		return gqlResp.Data.Transactions.Edges[0].Node.ID, nil
+	ids := make([]string, 0, len(gqlResp.Data.Transactions.Edges))
+	for _, e := range gqlResp.Data.Transactions.Edges {
+		if e.Node.ID != "" {
+			ids = append(ids, e.Node.ID)
+		}
 	}
-	return "", nil
+	return ids, nil
 }
 
 // DownloadTransactionDataRange downloads a byte range of a transaction's data.

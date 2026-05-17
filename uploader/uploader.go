@@ -115,30 +115,7 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 
 	// ── Dedup: check GraphQL for existing CAR ─────────────────────────
 	if state.ShouldAttemptDedup() {
-		existingTX := u.queryExistingCARWithRetry(result.RootCID)
-		if existingTX != "" {
-			fmt.Printf("   Found existing CAR on chain: %s\n", existingTX)
-			// Secondary verification: download key portions and validate CAR integrity.
-			if verified, verifyErr := VerifyRemoteCAR(u.cfg.Gateway, existingTX, result.RootCID); verifyErr != nil || !verified {
-				reason := "unknown"
-				if verifyErr != nil {
-					reason = verifyErr.Error()
-				}
-				fmt.Printf("   Warning: Found existing CAR but verification failed: %s\n", reason)
-				// Ignore the on-chain record and proceed with normal upload.
-			} else {
-				fmt.Printf("   CAR verified, reusing existing transaction\n")
-				state.CarTXID = existingTX
-				state.CarConfirmed = true
-				state.CarHeight = 0 // unknown, but confirmed
-				if err := state.TransitionTo(StatusCarConfirmed); err != nil {
-					state.Status = StatusCarConfirmed
-				}
-				if saveErr := state.Save(); saveErr != nil {
-					fmt.Printf("   Warning: failed to save state: %v\n", saveErr)
-				}
-			}
-		}
+		u.dedupCheckCAR(result, state)
 	}
 
 	// ── Check if already complete ─────────────────────────────────────
@@ -216,6 +193,9 @@ func (u *Uploader) uploadCarWithState(ctx context.Context, result *UploadResult,
 }
 
 // uploadCarRaw uploads CAR as a raw Arweave transaction with state tracking.
+//
+// For data >= ChunkSize (256 KiB) the function automatically switches to
+// chunked upload (POST /chunk) to avoid nginx 413 body-size limits.
 func (u *Uploader) uploadCarRaw(ctx context.Context, result *UploadResult, carBytes []byte, state *UploadState, cachePath string, arTags []arweave.Tag) error {
 	// Already confirmed?
 	if state.CarConfirmed {
@@ -236,6 +216,15 @@ func (u *Uploader) uploadCarRaw(ctx context.Context, result *UploadResult, carBy
 	state.TransitionTo(StatusCarUploading)
 	state.Save()
 
+	// ── Route: chunked or direct ──────────────────────────────────────
+	if len(carBytes) >= arweave.ChunkSize {
+		return u.uploadCarRawChunked(ctx, result, carBytes, state, cachePath, arTags)
+	}
+	return u.uploadCarRawDirect(ctx, result, carBytes, state, cachePath, arTags)
+}
+
+// uploadCarRawDirect submits the CAR as a single POST /tx (small files only).
+func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult, carBytes []byte, state *UploadState, cachePath string, arTags []arweave.Tag) error {
 	// Build, sign and submit the transaction
 	fmt.Printf("   Uploading CAR file (%d bytes)...\n", len(carBytes))
 
@@ -295,6 +284,40 @@ func (u *Uploader) uploadCarRaw(ctx context.Context, result *UploadResult, carBy
 	state.Save()
 
 	result.DataTXID = txID
+	result.DataHeight = status.BlockHeight
+	fmt.Printf("   CAR confirmed at height=%d\n", status.BlockHeight)
+
+	// Recompute PoW with actual data_txid
+	if pow.NeedsPoW(result.DataSize) {
+		if err := u.recomputePoW(ctx, result, cachePath); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// uploadCarRawChunked uploads the CAR via the chunked /chunk endpoint.
+func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult, carBytes []byte, state *UploadState, cachePath string, arTags []arweave.Tag) error {
+	fmt.Printf("   Uploading CAR file via chunked upload (%d bytes)...\n", len(carBytes))
+
+	tx, status, err := u.cfg.Gateway.UploadDataChunked(u.cfg.Wallet, carBytes, arTags)
+	if err != nil {
+		state.SetError(fmt.Errorf("chunked CAR upload failed: %w", err))
+		state.Save()
+		return stateError(state)
+	}
+
+	state.CarTXID = tx.ID
+	state.CarSubmittedAt = TimeNow()
+	state.CarConfirmed = true
+	state.CarHeight = status.BlockHeight
+	state.TransitionTo(StatusCarConfirmed)
+	state.RetryCount = 0
+	state.LastError = ""
+	state.Save()
+
+	result.DataTXID = tx.ID
 	result.DataHeight = status.BlockHeight
 	fmt.Printf("   CAR confirmed at height=%d\n", status.BlockHeight)
 
@@ -393,9 +416,8 @@ func (u *Uploader) uploadCarBundle(ctx context.Context, result *UploadResult, ca
 	state.TransitionTo(StatusCarUploading)
 	state.Save()
 
-	// Submit bundle as raw tx
-	fmt.Printf("   Uploading bundle (2 items, %d bytes)...\n", len(bundleData))
-	bundleTXID, err := u.cfg.Gateway.UploadDataRaw(bundleData)
+	// ── Submit bundle (chunked if large) ──────────────────────────────
+	bundleTXID, bundleHeight, err := u.submitBundleData(ctx, bundleData)
 	if err != nil {
 		state.SetError(fmt.Errorf("bundle upload failed: %w", err))
 		state.Save()
@@ -405,25 +427,11 @@ func (u *Uploader) uploadCarBundle(ctx context.Context, result *UploadResult, ca
 	state.CarTXID = bundleTXID // the bundle tx is the "CAR tx" for state tracking
 	state.BundleTXID = bundleTXID
 	state.CarSubmittedAt = TimeNow()
-	state.TransitionTo(StatusCarSubmitted)
-	state.Save()
-	fmt.Printf("   Bundle submitted: %s\n", bundleTXID)
-
-	// Wait for confirmation
-	status, err := u.cfg.Gateway.WaitForConfirmation(bundleTXID, 120, 3*time.Second)
-	if err != nil {
-		fmt.Printf("   Warning: Bundle confirmation check failed: %v\n", err)
-		state.SetError(fmt.Errorf("bundle confirmation timeout: %w", err))
-		state.Save()
-		return fmt.Errorf("bundle confirmation timeout (txid saved for resume): %w", err)
-	}
-
-	// Bundle confirmed — both CAR and meta are done
 	state.CarConfirmed = true
-	state.CarHeight = status.BlockHeight
+	state.CarHeight = bundleHeight
 	state.MetaTXID = metaItemID
 	state.MetaConfirmed = true
-	state.MetaHeight = status.BlockHeight
+	state.MetaHeight = bundleHeight
 	state.RetryCount = 0
 	state.LastError = ""
 	state.Status = StatusDone
@@ -433,9 +441,37 @@ func (u *Uploader) uploadCarBundle(ctx context.Context, result *UploadResult, ca
 	result.DataHeight = -1
 	result.BundleTXID = bundleTXID
 	result.MetaTXID = metaItemID
-	fmt.Printf("   Bundle confirmed at height=%d\n", status.BlockHeight)
+	fmt.Printf("   Bundle confirmed at height=%d\n", bundleHeight)
 
 	return nil
+}
+
+// submitBundleData uploads the bundle binary.  For data >= ChunkSize the
+// chunked endpoint is used; otherwise a direct POST /tx is attempted.
+func (u *Uploader) submitBundleData(ctx context.Context, bundleData []byte) (string, int, error) {
+	if len(bundleData) >= arweave.ChunkSize {
+		fmt.Printf("   Uploading bundle via chunked upload (%d bytes)...\n", len(bundleData))
+		// Use empty tags for the bundle transaction itself; the bundle
+		// items carry their own tags internally.
+		tx, status, err := u.cfg.Gateway.UploadDataChunked(u.cfg.Wallet, bundleData, nil)
+		if err != nil {
+			return "", 0, err
+		}
+		return tx.ID, status.BlockHeight, nil
+	}
+
+	fmt.Printf("   Uploading bundle (2 items, %d bytes)...\n", len(bundleData))
+	txID, err := u.cfg.Gateway.UploadDataRaw(bundleData)
+	if err != nil {
+		return "", 0, err
+	}
+
+	fmt.Printf("   Bundle submitted: %s\n", txID)
+	status, err := u.cfg.Gateway.WaitForConfirmation(txID, 120, 3*time.Second)
+	if err != nil {
+		return txID, 0, fmt.Errorf("bundle confirmation timeout (txid saved for resume): %w", err)
+	}
+	return txID, status.BlockHeight, nil
 }
 
 // =============================================================================
@@ -1075,18 +1111,55 @@ func effectivePoWWorkers(cfgWorkers int) int {
 	return pow.DefaultWorkers()
 }
 
-// queryExistingCARWithRetry attempts to query GraphQL for an existing CAR
-// transaction. Retries up to 3 times with exponential backoff (1s → 2s → 4s)
-// on network errors. Returns the existing tx ID (empty if none found) or an
-// empty string after all retries are exhausted.
-func (u *Uploader) queryExistingCARWithRetry(rootCID string) string {
+// dedupCheckCAR queries GraphQL for existing CAR transactions matching
+// the Root-CID and tries to verify each one.  If a valid match is found
+// the state is updated to reuse it.  If candidates exist but none pass
+// verification the file is marked as skipped (car_confirmed with empty
+// txid) so we don't waste AR on a duplicate upload.
+func (u *Uploader) dedupCheckCAR(result *UploadResult, state *UploadState) {
+	candidates := u.queryExistingCARsWithRetry(result.RootCID)
+	if len(candidates) == 0 {
+		return
+	}
+
+	for _, txID := range candidates {
+		fmt.Printf("   Found candidate CAR on chain: %s\n", txID)
+		verified, verifyErr := VerifyRemoteCAR(u.cfg.Gateway, txID, result.RootCID)
+		if verifyErr == nil && verified {
+			fmt.Printf("   CAR verified, reusing existing transaction\n")
+			state.CarTXID = txID
+			state.CarConfirmed = true
+			state.CarHeight = 0 // unknown, but confirmed
+			if err := state.TransitionTo(StatusCarConfirmed); err != nil {
+				state.Status = StatusCarConfirmed
+			}
+			if saveErr := state.Save(); saveErr != nil {
+				fmt.Printf("   Warning: failed to save state: %v\n", saveErr)
+			}
+			return
+		}
+		reason := "unknown"
+		if verifyErr != nil {
+			reason = verifyErr.Error()
+		}
+		fmt.Printf("   Warning: Candidate %s verification failed: %s\n", txID, reason)
+	}
+
+	// All candidates failed verification — fall back to fresh upload.
+	fmt.Printf("   Warning: %d existing CAR(s) found but all failed verification, falling back to fresh upload\n", len(candidates))
+}
+
+// queryExistingCARsWithRetry queries GraphQL for existing CAR transactions
+// matching the given rootCID. Retries up to 3 times with exponential backoff
+// on network errors. Returns up to 5 candidate tx IDs (empty if none found).
+func (u *Uploader) queryExistingCARsWithRetry(rootCID string) []string {
 	maxRetries := 3
 	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
 	for i := 0; i < maxRetries; i++ {
-		existingTX, err := u.cfg.Gateway.QueryExistingCAR(rootCID)
+		ids, err := u.cfg.Gateway.QueryExistingCARs(rootCID, 5)
 		if err == nil {
-			return existingTX
+			return ids
 		}
 		if i < maxRetries-1 {
 			fmt.Printf("   Warning: GraphQL dedup check failed (attempt %d/%d): %v\n", i+1, maxRetries, err)
@@ -1095,7 +1168,7 @@ func (u *Uploader) queryExistingCARWithRetry(rootCID string) string {
 	}
 
 	fmt.Printf("   Warning: cannot query chain for dedup, continuing with fresh upload\n")
-	return ""
+	return nil
 }
 
 // stateError formats the last error from state.

@@ -236,6 +236,9 @@ func (gc *GatewayClient) verifyAllChunks(txID string, tx *goartypes.Transaction,
 // signing path (GetSignatureData → DeepHash → deepHashStr) expects
 // base64-encoded strings (it decodes them internally).  Raw strings
 // would fail base64 decoding and produce wrong signatures.
+//
+// IMPORTANT: Because tags are stored base64-encoded on-chain, GraphQL
+// dedup queries must search for the base64-encoded form of tag values.
 func buildGoarTransaction(owner string, dataSize int64, tags []Tag, reward string, lastTx string) *goartypes.Transaction {
 	goarTags := make([]goartypes.Tag, len(tags))
 	for i, t := range tags {
