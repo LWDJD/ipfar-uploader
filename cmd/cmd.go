@@ -17,6 +17,7 @@ var (
 	walletPath string
 	gatewayURL string
 	useBundle  bool
+	method     string
 	bundleSize int
 	powWorkers int
 )
@@ -56,7 +57,8 @@ func runFile(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("file", flag.ExitOnError)
 	fs.StringVar(&walletPath, "wallet", "", "Path to Arweave JWK wallet file (required)")
 	fs.StringVar(&gatewayURL, "gateway", "https://arweave.net", "Arweave gateway URL")
-	fs.BoolVar(&useBundle, "bundle", false, "Use ANS-104 bundle upload")
+	fs.BoolVar(&useBundle, "bundle", false, "Use ANS-104 bundle upload (shorthand for --method bundle)")
+	fs.StringVar(&method, "method", "", "Upload method: raw, bundle, cross-bundle (overrides --bundle)")
 	fs.IntVar(&bundleSize, "bundle-size", 0, "Max items per bundle (0 = all in one)")
 	fs.IntVar(&powWorkers, "pow-workers", 0, "Number of parallel PoW workers (0 = auto)")
 
@@ -76,7 +78,8 @@ func runDir(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("dir", flag.ExitOnError)
 	fs.StringVar(&walletPath, "wallet", "", "Path to Arweave JWK wallet file (required)")
 	fs.StringVar(&gatewayURL, "gateway", "https://arweave.net", "Arweave gateway URL")
-	fs.BoolVar(&useBundle, "bundle", false, "Use ANS-104 bundle upload")
+	fs.BoolVar(&useBundle, "bundle", false, "Use ANS-104 bundle upload (shorthand for --method bundle)")
+	fs.StringVar(&method, "method", "", "Upload method: raw, bundle, cross-bundle (overrides --bundle)")
 	fs.IntVar(&bundleSize, "bundle-size", 0, "Max items per bundle (0 = all in one)")
 	fs.IntVar(&powWorkers, "pow-workers", 0, "Number of parallel PoW workers (0 = auto)")
 
@@ -191,7 +194,13 @@ func buildConfig() (*uploader.Config, error) {
 	cfg := uploader.NewDefaultConfig()
 	cfg.Wallet = wallet
 	cfg.Gateway = arweave.NewGatewayClient(gatewayURL)
-	cfg.UseBundle = useBundle
+
+	// --method overrides --bundle
+	if method != "" {
+		cfg.UseBundle = (method == "bundle" || method == "cross-bundle")
+	} else {
+		cfg.UseBundle = useBundle
+	}
 	cfg.BundleSize = bundleSize
 	cfg.PoWWorkers = powWorkers
 
@@ -209,6 +218,9 @@ func printResult(r *uploader.UploadResult) {
 	fmt.Printf("   Root CID:    %s\n", r.RootCID)
 	fmt.Printf("   Data TXID:   %s\n", r.DataTXID)
 	fmt.Printf("   Data Height: %d\n", r.DataHeight)
+	if r.BundleTXID != "" {
+		fmt.Printf("   Bundle TXID: %s\n", r.BundleTXID)
+	}
 	fmt.Printf("   Meta TXID:   %s\n", r.MetaTXID)
 	fmt.Printf("   Size:        %d bytes\n", r.DataSize)
 	fmt.Printf("   Method:      %s\n", r.Method)
@@ -258,8 +270,10 @@ COMMANDS:
 OPTIONS (for file/dir):
   --wallet <path>    Path to Arweave JWK wallet file
   --gateway <url>    Arweave gateway URL (default: https://arweave.net)
-  --bundle           Use ANS-104 bundle upload
+  --bundle           Use ANS-104 bundle upload (same-bundle, data_height=-1)
+  --method <method>  Upload method: raw, bundle, cross-bundle
   --bundle-size <n>  Max items per bundle (0 = all in one)
+  --pow-workers <n>  Number of parallel PoW workers (0 = auto)
 
 EXAMPLES:
   ipfar-uploader file --wallet wallet.json myfile.png

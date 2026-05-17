@@ -34,8 +34,9 @@ var (
 )
 
 type ReferenceEntry struct {
-	Height int      `json:"height"`
-	CIDs   []string `json:"cids"`
+	Height     int      `json:"height"`
+	BundleTXID string   `json:"bundle_txid,omitempty"`
+	CIDs       []string `json:"cids"`
 }
 
 type ReferenceMap map[string]ReferenceEntry
@@ -45,6 +46,7 @@ type Metadata struct {
 	Method       string        `json:"method"`
 	RootCID      string        `json:"root_cid"`
 	DataTXID     string        `json:"data_txid"`
+	BundleTXID   string        `json:"bundle_txid,omitempty"`
 	DataHeight   int           `json:"data_height"`
 	DataSize     int           `json:"data_size"`
 	Reference    *ReferenceMap `json:"reference,omitempty"`
@@ -98,11 +100,23 @@ func (m *Metadata) Validate() error {
 	if m.DataTXID == "" {
 		return fmt.Errorf("%w: data_txid", ErrMissingField)
 	}
-	if m.DataHeight < 0 {
-		return fmt.Errorf("%w: got %d", ErrInvalidDataHeight, m.DataHeight)
+	// data_height = -1 is valid only for bundle method
+	if m.DataHeight < -1 || (m.DataHeight == -1 && m.Method != MethodBundle) {
+		return fmt.Errorf("%w: got %d for method %q", ErrInvalidDataHeight, m.DataHeight, m.Method)
 	}
 	if m.DataSize <= 0 {
 		return fmt.Errorf("%w: got %d", ErrInvalidDataSize, m.DataSize)
+	}
+	// bundle_txid validation
+	if m.Method == MethodBundle {
+		if m.BundleTXID == "" {
+			return fmt.Errorf("%w: bundle_txid is required for bundle method", ErrMissingField)
+		}
+		if m.DataHeight == -1 && m.BundleTXID != "none" {
+			return fmt.Errorf("bundle_txid must be \"none\" when data_height = -1, got %q", m.BundleTXID)
+		}
+	} else if m.Method == MethodRaw && m.BundleTXID != "" {
+		return fmt.Errorf("bundle_txid must not be set for raw method")
 	}
 	if m.Reference != nil {
 		if err := validateReference(m.Reference); err != nil {
@@ -148,8 +162,8 @@ func validateReference(ref *ReferenceMap) error {
 		if txid == "" {
 			return fmt.Errorf("%w: empty transaction ID key", ErrInvalidReference)
 		}
-		if entry.Height < 0 {
-			return fmt.Errorf("%w: negative height %d for txid %q", ErrInvalidReference, entry.Height, txid)
+		if entry.Height < -1 {
+			return fmt.Errorf("%w: invalid height %d for txid %q", ErrInvalidReference, entry.Height, txid)
 		}
 		if len(entry.CIDs) == 0 {
 			return fmt.Errorf("%w: empty cids list for txid %q", ErrInvalidReference, txid)

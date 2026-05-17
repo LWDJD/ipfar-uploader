@@ -143,16 +143,80 @@ func TestMetadata_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "bundle method valid",
+			name: "bundle method valid (height >= 0)",
 			meta: &Metadata{
 				Version:    Version1,
 				Method:     MethodBundle,
 				RootCID:    "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
 				DataTXID:   "test-tx-id-1234567890123456789012345678901234567890123",
+				BundleTXID: "actual-bundle-tx-id",
 				DataHeight: 100,
 				DataSize:   200 * 1024 * 1024,
 			},
 			wantErr: false,
+		},
+		{
+			name: "bundle method valid (height = -1, same bundle)",
+			meta: &Metadata{
+				Version:    Version1,
+				Method:     MethodBundle,
+				RootCID:    "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+				DataTXID:   "test-tx-id-1234567890123456789012345678901234567890123",
+				BundleTXID: "none",
+				DataHeight: -1,
+				DataSize:   200 * 1024 * 1024,
+			},
+			wantErr: false,
+		},
+		{
+			name: "bundle method invalid: data_height=-1 but bundle_txid not none",
+			meta: &Metadata{
+				Version:    Version1,
+				Method:     MethodBundle,
+				RootCID:    "bafytest",
+				DataTXID:   "txid123",
+				BundleTXID: "some-other-txid",
+				DataHeight: -1,
+				DataSize:   200 * 1024 * 1024,
+			},
+			wantErr: true,
+		},
+		{
+			name: "bundle method invalid: missing bundle_txid",
+			meta: &Metadata{
+				Version:    Version1,
+				Method:     MethodBundle,
+				RootCID:    "bafytest",
+				DataTXID:   "txid123",
+				DataHeight: 100,
+				DataSize:   200 * 1024 * 1024,
+			},
+			wantErr: true,
+		},
+		{
+			name: "raw method invalid: data_height = -1",
+			meta: &Metadata{
+				Version:    Version1,
+				Method:     MethodRaw,
+				RootCID:    "bafytest",
+				DataTXID:   "txid123",
+				DataHeight: -1,
+				DataSize:   200 * 1024 * 1024,
+			},
+			wantErr: true,
+		},
+		{
+			name: "raw method invalid: bundle_txid set",
+			meta: &Metadata{
+				Version:    Version1,
+				Method:     MethodRaw,
+				RootCID:    "bafytest",
+				DataTXID:   "txid123",
+				BundleTXID: "something",
+				DataHeight: 100,
+				DataSize:   200 * 1024 * 1024,
+			},
+			wantErr: true,
 		},
 	}
 
@@ -250,6 +314,15 @@ func TestReference(t *testing.T) {
 	err := validateReference(ref)
 	if err != nil {
 		t.Errorf("valid reference should pass: %v", err)
+	}
+
+	// Height = -1 (same bundle reference) should be valid
+	refNeg := &ReferenceMap{
+		"txid-1": {Height: -1, CIDs: []string{"bafy1"}},
+	}
+	err = validateReference(refNeg)
+	if err != nil {
+		t.Errorf("reference with height=-1 should pass: %v", err)
 	}
 
 	// Empty CID list
