@@ -150,6 +150,11 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 		}
 	}
 
+	// ── Metadata confirmation check (submitted but not confirmed) ────
+	if state.NeedsMetaConfirmation() {
+		u.handleMetaResume(ctx, result, state)
+	}
+
 	// ── Metadata upload (if needed) ───────────────────────────────────
 	if state.NeedsMetaUpload() {
 		if err := u.uploadMetaWithState(ctx, result, state); err != nil {
@@ -494,6 +499,21 @@ func (u *Uploader) uploadMetaWithState(ctx context.Context, result *UploadResult
 	debugLog("uploadMetaWithState: metaJSON preview=%.100s", string(metaJSON))
 	metaTX, metaStatus, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, []byte(metaBase64), toArweaveTags(metaTags))
 	if err != nil {
+		// Check whether the transaction was submitted successfully but
+		// WaitForConfirmation timed out.  In that case metaTX carries a
+		// valid tx ID — save it, mark submitted, and continue.
+		if metaTX != nil && metaTX.ID != "" {
+			fmt.Printf("   Warning: metadata submitted but not yet confirmed (txid=%s), will check on next run\n", metaTX.ID)
+			state.MetaTXID = metaTX.ID
+			state.MetaSubmittedAt = TimeNow()
+			state.RetryCount = 0
+			state.LastError = ""
+			state.TransitionTo(StatusMetaSubmitted)
+			state.Save()
+			result.MetaTXID = metaTX.ID
+			return nil
+		}
+		// Real submission failure (POST /tx or /chunk failed).
 		state.SetError(fmt.Errorf("metadata upload failed: %w", err))
 		state.Save()
 		return stateError(state)
@@ -589,6 +609,38 @@ func (u *Uploader) handleCarResume(ctx context.Context, state *UploadState) {
 		state.Status = StatusPending
 		state.Save()
 	}
+}
+
+// handleMetaResume checks the status of a previously-submitted metadata
+// transaction and updates state accordingly.  Unlike handleCarResume, a
+// metadata transaction that is still unconfirmed is NOT resubmitted — the
+// tx was already accepted by the gateway and will eventually confirm.
+func (u *Uploader) handleMetaResume(ctx context.Context, result *UploadResult, state *UploadState) {
+	fmt.Printf("   Resuming: checking metadata tx %s...\n", state.MetaTXID)
+
+	status, err := u.cfg.Gateway.GetTransactionStatus(ctx, state.MetaTXID)
+	if err != nil {
+		fmt.Printf("   Warning: failed to check metadata tx status: %v\n", err)
+		// Don't resubmit — the tx is already on the network.  Just wait
+		// for the next run.
+		return
+	}
+
+	if status.Confirmed && status.BlockHeight > 0 {
+		fmt.Printf("   Metadata tx confirmed at height=%d\n", status.BlockHeight)
+		state.MetaConfirmed = true
+		state.MetaHeight = status.BlockHeight
+		if err := state.TransitionTo(StatusMetaConfirmed); err != nil {
+			state.Status = StatusMetaConfirmed
+		}
+		state.LastError = ""
+		state.Save()
+		result.MetaTXID = state.MetaTXID
+		return
+	}
+
+	// Not yet confirmed — keep waiting.  Do NOT resubmit.
+	fmt.Printf("   Metadata tx not yet confirmed, will check on next run\n")
 }
 
 func parseSubmittedAt(s string) time.Time {
@@ -984,13 +1036,15 @@ func (u *Uploader) dedupCheckCAR(ctx context.Context, result *UploadResult, stat
 		if verifyErr == nil && verified {
 			fmt.Printf("   CAR verified, reusing existing transaction\n")
 			// Extract real block height from transaction status
-			realHeight := 0
-			if status, err := u.cfg.Gateway.GetTransactionStatus(ctx, txID); err == nil {
-				realHeight = status.BlockHeight
+			status, statusErr := u.cfg.Gateway.GetTransactionStatus(ctx, txID)
+			if statusErr != nil || status == nil || status.BlockHeight <= 0 {
+				debugLog("dedupCheckCAR: GetTransactionStatus failed for %s: %v", txID, statusErr)
+				fmt.Printf("   Warning: Candidate %s verification failed: cannot get block height\n", txID)
+				continue
 			}
 			state.CarTXID = txID
 			state.CarConfirmed = true
-			state.CarHeight = realHeight
+			state.CarHeight = status.BlockHeight
 			if err := state.TransitionTo(StatusCarConfirmed); err != nil {
 				state.Status = StatusCarConfirmed
 			}

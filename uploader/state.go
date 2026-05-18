@@ -174,9 +174,19 @@ func (s *UploadState) NeedsCARUpload() bool {
 	return !s.CarConfirmed
 }
 
-// NeedsMetaUpload returns true if CAR is confirmed but metadata is not.
+// NeedsMetaUpload returns true if CAR is confirmed but metadata has not been
+// submitted yet.  If a metadata tx was already submitted (MetaTXID non-empty)
+// but not yet confirmed, this returns false — the uploader should wait for
+// confirmation instead of re-uploading (see NeedsMetaConfirmation).
 func (s *UploadState) NeedsMetaUpload() bool {
-	return s.CarConfirmed && !s.MetaConfirmed
+	return s.CarConfirmed && !s.MetaConfirmed && s.MetaTXID == ""
+}
+
+// NeedsMetaConfirmation returns true when metadata was submitted (MetaTXID is
+// set) but has not yet been confirmed on chain.  The uploader should poll
+// GET /tx/{id} to check whether the transaction has been mined.
+func (s *UploadState) NeedsMetaConfirmation() bool {
+	return s.CarConfirmed && s.MetaTXID != "" && !s.MetaConfirmed
 }
 
 // CanResubmitCAR returns true when:
