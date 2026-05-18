@@ -559,62 +559,16 @@ func (gc *GatewayClient) GetAnchor(ctx context.Context) (string, error) {
 
 // UploadData creates, signs, submits and waits for confirmation of a data transaction.
 //
-// For data >= 256 KiB the function transparently switches to chunked upload
-// (POST /chunk) to avoid nginx 413 body-size limits on the gateway.
+// All uploads now go through the chunked path (goar) which correctly uses
+// SHA-384 deep hash and base64url-encoded tags required by Arweave mainnet
+// gateways.  The local Transaction path (SHA-256 deep hash, plaintext tags)
+// is no longer used because it produces signatures that mainnet gateways
+// reject as "Invalid JSON".
 //
 // Transient gateway errors (502, 503, 504) are automatically retried up to
 // 3 times with exponential backoff (1s → 2s → 4s).
 func (gc *GatewayClient) UploadData(ctx context.Context, wallet *Wallet, data []byte, tags []Tag) (*Transaction, *TransactionStatus, error) {
-	if len(data) >= ChunkSize {
-		return gc.UploadDataChunked(ctx, wallet, data, tags)
-	}
-
-	var tx *Transaction
-	var status *TransactionStatus
-
-	const maxRetries = 3
-	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
-
-	err := retryWithBackoff(ctx, func() error {
-		anchor, aErr := gc.GetAnchor(ctx)
-		if aErr != nil {
-			anchor = ""
-		}
-
-		reward, rErr := gc.GetReward(ctx, int64(len(data)))
-		if rErr != nil {
-			reward = "0"
-		}
-
-		tb := NewTransactionBuilder(wallet.Owner)
-		tb.SetData(data)
-		tb.SetTags(tags)
-		tb.SetLastTx(anchor)
-		tb.SetReward(reward)
-
-		tx = tb.Build()
-		if sErr := tx.Sign(wallet.PrivateKey); sErr != nil {
-			return fmt.Errorf("failed to sign: %w", sErr)
-		}
-
-		txID, sErr := gc.SubmitTransaction(ctx, tx)
-		if sErr != nil {
-			return fmt.Errorf("failed to submit: %w", sErr)
-		}
-		tx.ID = txID
-
-		var cErr error
-		status, cErr = gc.WaitForConfirmation(ctx, txID, 120, 3*time.Second)
-		if cErr != nil {
-			return fmt.Errorf("submitted but unconfirmed: %w", cErr)
-		}
-		return nil
-	}, maxRetries, delays)
-
-	if err != nil {
-		return tx, status, err
-	}
-	return tx, status, nil
+	return gc.UploadDataChunked(ctx, wallet, data, tags)
 }
 
 // UploadDataRaw submits an already-signed raw transaction bytes (bundle).

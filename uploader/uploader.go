@@ -224,57 +224,19 @@ func (u *Uploader) uploadCarRaw(ctx context.Context, result *UploadResult, carBy
 
 // uploadCarRawDirect submits the CAR as a single POST /tx (small files only).
 func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult, carBytes []byte, state *UploadState, cachePath string, arTags []arweave.Tag) error {
-	// Build, sign and submit the transaction
+	// Upload via chunked path (goar) — uses SHA-384 deep hash and
+	// base64url-encoded tags required by Arweave mainnet gateways.
 	fmt.Printf("   Uploading CAR file (%d bytes)...\n", len(carBytes))
 
-	anchor, err := u.cfg.Gateway.GetAnchor(ctx)
+	tx, status, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, carBytes, arTags)
 	if err != nil {
-		anchor = ""
-	}
-
-	reward, err := u.cfg.Gateway.GetReward(ctx, int64(len(carBytes)))
-	if err != nil {
-		reward = "0"
-	}
-
-	tb := arweave.NewTransactionBuilder(u.cfg.Wallet.Owner)
-	tb.SetData(carBytes)
-	tb.SetTags(arTags)
-	tb.SetLastTx(anchor)
-	tb.SetReward(reward)
-
-	tx := tb.Build()
-	if err := tx.Sign(u.cfg.Wallet.PrivateKey); err != nil {
-		state.SetError(fmt.Errorf("failed to sign CAR tx: %w", err))
+		state.SetError(fmt.Errorf("CAR upload failed: %w", err))
 		state.Save()
 		return stateError(state)
 	}
 
-	txID, err := u.cfg.Gateway.SubmitTransaction(ctx, tx)
-	if err != nil {
-		state.SetError(fmt.Errorf("failed to submit CAR tx: %w", err))
-		state.Save()
-		return stateError(state)
-	}
-	tx.ID = txID
-
-	state.CarTXID = txID
+	state.CarTXID = tx.ID
 	state.CarSubmittedAt = TimeNow()
-	state.TransitionTo(StatusCarSubmitted)
-	state.Save()
-
-	fmt.Printf("   CAR submitted: %s\n", txID)
-
-	// Wait for confirmation
-	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, txID, 120, 3*time.Second)
-	if err != nil {
-		// Don't mark as error — allow resume
-		fmt.Printf("   Warning: CAR confirmation wait failed: %v\n", err)
-		state.SetError(fmt.Errorf("CAR confirmation timeout: %w", err))
-		state.Save()
-		return fmt.Errorf("CAR confirmation timeout (txid saved for resume): %w", err)
-	}
-
 	state.CarConfirmed = true
 	state.CarHeight = status.BlockHeight
 	state.TransitionTo(StatusCarConfirmed)
@@ -282,7 +244,7 @@ func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult,
 	state.LastError = ""
 	state.Save()
 
-	result.DataTXID = txID
+	result.DataTXID = tx.ID
 	result.DataHeight = status.BlockHeight
 	fmt.Printf("   CAR confirmed at height=%d\n", status.BlockHeight)
 
@@ -514,63 +476,27 @@ func (u *Uploader) uploadMetaWithState(ctx context.Context, result *UploadResult
 	state.TransitionTo(StatusMetaUploading)
 	state.Save()
 
-	// Build, sign, submit
+	// Upload via chunked path (goar) — uses SHA-384 deep hash and
+	// base64url-encoded tags required by Arweave mainnet gateways.
 	fmt.Printf("   Uploading metadata...\n")
-
-	anchor, err := u.cfg.Gateway.GetAnchor(ctx)
+	metaTX, metaStatus, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, []byte(metaBase64), toArweaveTags(metaTags))
 	if err != nil {
-		anchor = ""
-	}
-	reward, err := u.cfg.Gateway.GetReward(ctx, int64(len(metaBase64)))
-	if err != nil {
-		reward = "0"
-	}
-
-	tb := arweave.NewTransactionBuilder(u.cfg.Wallet.Owner)
-	tb.SetData([]byte(metaBase64))
-	tb.SetTags(toArweaveTags(metaTags))
-	tb.SetLastTx(anchor)
-	tb.SetReward(reward)
-
-	tx := tb.Build()
-	if err := tx.Sign(u.cfg.Wallet.PrivateKey); err != nil {
-		state.SetError(fmt.Errorf("failed to sign meta tx: %w", err))
+		state.SetError(fmt.Errorf("metadata upload failed: %w", err))
 		state.Save()
 		return stateError(state)
 	}
 
-	metaTXID, err := u.cfg.Gateway.SubmitTransaction(ctx, tx)
-	if err != nil {
-		state.SetError(fmt.Errorf("failed to submit meta tx: %w", err))
-		state.Save()
-		return stateError(state)
-	}
-	tx.ID = metaTXID
-
-	state.MetaTXID = metaTXID
+	state.MetaTXID = metaTX.ID
 	state.MetaSubmittedAt = TimeNow()
-	state.TransitionTo(StatusMetaSubmitted)
-	state.Save()
-	fmt.Printf("   Metadata submitted: %s\n", metaTXID)
-
-	// Wait for confirmation
-	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, metaTXID, 120, 3*time.Second)
-	if err != nil {
-		fmt.Printf("   Warning: Metadata confirmation wait failed: %v\n", err)
-		state.SetError(fmt.Errorf("meta confirmation timeout: %w", err))
-		state.Save()
-		return fmt.Errorf("meta confirmation timeout (txid saved for resume): %w", err)
-	}
-
 	state.MetaConfirmed = true
-	state.MetaHeight = status.BlockHeight
+	state.MetaHeight = metaStatus.BlockHeight
 	state.RetryCount = 0
 	state.LastError = ""
 	state.TransitionTo(StatusMetaConfirmed)
 	state.Save()
 
-	result.MetaTXID = metaTXID
-	fmt.Printf("   Metadata confirmed at height=%d\n", status.BlockHeight)
+	result.MetaTXID = metaTX.ID
+	fmt.Printf("   Metadata confirmed at height=%d\n", metaStatus.BlockHeight)
 
 	return nil
 }
