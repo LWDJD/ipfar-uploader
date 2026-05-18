@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/LWDJD/ipfar-uploader/arweave"
@@ -22,6 +23,13 @@ func newMockGateway(t *testing.T, carBytes []byte) (*arweave.GatewayClient, stri
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// GET /tx/{txID} returns transaction JSON with data_size
+		if strings.HasPrefix(r.URL.Path, "/tx/") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data_size":%d}`, len(carBytes))
+			return
+		}
+
 		// Support HEAD for file size
 		if r.Method == http.MethodHead {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(carBytes)))
@@ -289,19 +297,26 @@ func TestParseContentRangeTotal_Malformed(t *testing.T) {
 	t.Logf("correctly rejected malformed Content-Range: %v", err)
 }
 
-// TestVerifyRemoteCAR_CrossCheckSizeMismatch tests that when a legacy-format
-// CAR has a header-derived size that doesn't match Content-Range, an error
-// is returned (truncated file detection).
-func TestVerifyRemoteCAR_CrossCheckSizeMismatch(t *testing.T) {
-	carBytes, rootCID, err := car.CreateCarV2FromBytes([]byte("cross-check test data"))
+// TestVerifyRemoteCAR_TruncatedDataSize tests that when /tx/{txID} returns
+// a data_size that is too small (truncated), the SDK parser fails because
+// it cannot read the index at the end of the file.
+func TestVerifyRemoteCAR_TruncatedDataSize(t *testing.T) {
+	carBytes, rootCID, err := car.CreateCarV2FromBytes([]byte("truncated data_size test"))
 	if err != nil {
 		t.Fatalf("failed to create CAR v2: %v", err)
 	}
 
-	// Build a mock that returns a Content-Range total that doesn't match
-	// the header-derived size (simulating a truncated file).
+	// Build a mock that returns a truncated data_size (file appears too small).
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// /tx/{txID} returns a data_size that is too small
+		if strings.HasPrefix(r.URL.Path, "/tx/") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"data_size":%d}`, len(carBytes)-50)
+			return
+		}
+
+		// Range requests serve real data (but reader won't reach the index)
 		rangeHeader := r.Header.Get("Range")
 		if rangeHeader != "" {
 			var start, end int64
@@ -321,11 +336,8 @@ func TestVerifyRemoteCAR_CrossCheckSizeMismatch(t *testing.T) {
 			if end >= int64(len(carBytes)) {
 				end = int64(len(carBytes)) - 1
 			}
-
-			// Lie about total size — add 100 bytes
-			fakeTotal := len(carBytes) + 100
 			w.Header().Set("Content-Range",
-				fmt.Sprintf("bytes %d-%d/%d", start, end, fakeTotal))
+				fmt.Sprintf("bytes %d-%d/%d", start, end, len(carBytes)))
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
 			w.WriteHeader(http.StatusPartialContent)
 			w.Write(carBytes[start : end+1])
@@ -342,15 +354,16 @@ func TestVerifyRemoteCAR_CrossCheckSizeMismatch(t *testing.T) {
 	gateway := arweave.NewGatewayClient(server.URL)
 	txID := "mock-tx-id"
 
-	// The header says one size, Content-Range says another → should fail
+	// The truncated data_size should cause the parser to fail when
+	// trying to read the index (which is near the real end of the file).
 	verified, err := VerifyRemoteCAR(context.Background(), gateway, txID, rootCID.String())
 	if err == nil {
-		t.Fatal("expected error for size mismatch, got nil")
+		t.Fatal("expected error for truncated data_size, got nil")
 	}
 	if verified {
-		t.Fatal("expected verified=false for size mismatch")
+		t.Fatal("expected verified=false for truncated data_size")
 	}
-	t.Logf("correctly detected size mismatch: %v", err)
+	t.Logf("correctly detected truncated data_size: %v", err)
 }
 
 // =============================================================================

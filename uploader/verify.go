@@ -174,12 +174,8 @@ func parseContentRangeTotal(cr string) (int64, error) {
 // VerifyRemoteCAR downloads key portions of a remote CAR file from Arweave
 // and validates it using the SDK's CAR parser (ipfar-sdk/verify/ipfs).
 //
-// The file size is obtained from the Content-Range header of the initial
-// Range request (bytes 0–199), which also captures the CAR v2 header.
-// For legacy-format CARs the header-derived size is cross-checked against
-// the Content-Range total as a sanity measure.
-//
-// No HEAD request is needed; only standard Range requests are used.
+// The file size is obtained from the data_size field of GET /tx/{txID}.
+// No HEAD or Range requests are needed for size discovery.
 //
 // Checks performed:
 //  1. CAR version == 2
@@ -189,31 +185,13 @@ func parseContentRangeTotal(cr string) (int64, error) {
 //
 // Returns (true, nil) when the CAR passes every check.
 func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID string, expectedRootCID string) (bool, error) {
-	// ── 1. Download the first 200 bytes + get total size ────────────
-	headerBytes, resp, err := gateway.DownloadRangeWithResponse(ctx, txID, 0, 199)
+	// ── 1. Get file size from /tx/{txID} ────────────────────────────
+	fileSize, err := gateway.GetTransactionDataSize(ctx, txID)
 	if err != nil {
-		return false, fmt.Errorf("failed to download CAR header: %w", err)
+		return false, fmt.Errorf("failed to get data size from /tx/%s: %w", txID, err)
 	}
 
-	fileSize, err := parseContentRangeTotal(resp.Header.Get("Content-Range"))
-	if err != nil {
-		return false, fmt.Errorf("failed to get file size from Content-Range: %w", err)
-	}
-
-	// ── 2. Parse v2 header (validation + cross-check for legacy) ────
-	derivedSize, err := parseV2Header(headerBytes)
-	if err != nil {
-		return false, fmt.Errorf("failed to parse CAR v2 header: %w", err)
-	}
-
-	// For legacy format the header contains IndexSize; cross-check it
-	// against the Content-Range total to detect truncated files.
-	if derivedSize > 0 && derivedSize != fileSize {
-		return false, fmt.Errorf("CAR size mismatch: header says %d, Content-Range says %d",
-			derivedSize, fileSize)
-	}
-
-	// ── 3. Create SDK parser backed by remote reader ────────────────
+	// ── 2. Create SDK parser backed by remote reader ────────────────
 	reader := newRemoteCarReader(ctx, gateway, txID, fileSize)
 	parser, err := sdkcar.NewCarParserFromReader(reader, fileSize)
 	if err != nil {
@@ -221,23 +199,23 @@ func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID s
 	}
 	defer parser.Close()
 
-	// ── 4. Parse CAR metadata (headers only) ────────────────────────
+	// ── 3. Parse CAR metadata (headers only) ────────────────────────
 	info, err := parser.ParseInfo()
 	if err != nil {
 		return false, fmt.Errorf("failed to parse CAR info: %w", err)
 	}
 
-	// ── 5. Check version ────────────────────────────────────────────
+	// ── 4. Check version ────────────────────────────────────────────
 	if info.Version != 2 {
 		return false, fmt.Errorf("expected CAR v2, got v%d", info.Version)
 	}
 
-	// ── 6. Check index presence ─────────────────────────────────────
+	// ── 5. Check index presence ─────────────────────────────────────
 	if !info.HasIndex {
 		return false, fmt.Errorf("CAR file has no index")
 	}
 
-	// ── 7. Root CID match ───────────────────────────────────────────
+	// ── 6. Root CID match ───────────────────────────────────────────
 	expectedCID, err := cid.Decode(expectedRootCID)
 	if err != nil {
 		return false, fmt.Errorf("invalid expected root CID %q: %w", expectedRootCID, err)
@@ -255,7 +233,7 @@ func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID s
 			expectedRootCID, info.Roots)
 	}
 
-	// ── 8. Validate index integrity ─────────────────────────────────
+	// ── 7. Validate index integrity ─────────────────────────────────
 	if err := parser.ValidateIndex(); err != nil {
 		return false, fmt.Errorf("index validation failed: %w", err)
 	}

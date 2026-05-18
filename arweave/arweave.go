@@ -452,6 +452,35 @@ func (gc *GatewayClient) GetTransactionStatus(ctx context.Context, txID string) 
 	}, nil
 }
 
+// GetTransactionDataSize fetches the data_size field from the /tx/{txID} endpoint.
+func (gc *GatewayClient) GetTransactionDataSize(ctx context.Context, txID string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", gc.GatewayURL+"/tx/"+txID, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := gc.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("gateway returned %d", resp.StatusCode)
+	}
+
+	var result struct {
+		DataSize int64 `json:"data_size"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, err
+	}
+	if result.DataSize <= 0 {
+		return 0, fmt.Errorf("invalid data_size: %d", result.DataSize)
+	}
+	return result.DataSize, nil
+}
+
 // WaitForConfirmation polls until the transaction is confirmed.
 // The loop respects context cancellation.
 func (gc *GatewayClient) WaitForConfirmation(ctx context.Context, txID string, maxRetries int, interval time.Duration) (*TransactionStatus, error) {
