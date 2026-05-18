@@ -251,13 +251,13 @@ func (gc *GatewayClient) verifyAllChunks(ctx context.Context, txID string, tx *g
 
 // buildGoarTransaction creates a goar Transaction from wallet + data info.
 //
-// Tag names and values are base64url-encoded here because the goar
-// signing path (GetSignatureData → DeepHash → deepHashStr) expects
-// base64-encoded strings (it decodes them internally).  Raw strings
-// would fail base64 decoding and produce wrong signatures.
+// Tags are Base64-encoded here because goar's signing path
+// (GetSignatureData → DeepHash → deepHashStr) unconditionally Base64-decodes
+// every string element including tag name/value pairs.  Plaintext strings
+// would fail decoding and produce wrong signatures.
 //
-// IMPORTANT: Because tags are stored base64-encoded on-chain, GraphQL
-// dedup queries must search for the base64-encoded form of tag values.
+// After signing, the caller MUST replace tx.Tags with their plaintext
+// equivalents so that on-chain tags are human-readable per the IPFAR spec.
 func buildGoarTransaction(owner string, dataSize int64, tags []Tag, reward string, lastTx string) *goartypes.Transaction {
 	goarTags := make([]goartypes.Tag, len(tags))
 	for i, t := range tags {
@@ -341,6 +341,11 @@ func (gc *GatewayClient) uploadDataChunkedInternal(
 	if err := signTxGoar(tx, wallet); err != nil {
 		return nil, nil, fmt.Errorf("failed to sign chunked tx: %w", err)
 	}
+
+	// Replace Base64-encoded tags with plaintext for on-chain storage.
+	// The goar signing path requires Base64 input (deepHashStr decodes),
+	// but the IPFAR spec mandates human-readable tag values.
+	tx.Tags = goarTags
 
 	// Steps 3–6 are network operations — wrap with retry.
 	const maxRetries = 3

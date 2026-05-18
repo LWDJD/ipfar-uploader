@@ -865,10 +865,10 @@ func (gc *GatewayClient) QueryExistingCAR(ctx context.Context, rootCID string) (
 // QueryExistingCARs returns up to limit matching transaction IDs for the
 // given Root-CID, ordered by block height descending (newest first).
 //
-// Filters: Root-CID exact match, Content-Type = application/vnd.ipld.car
-// (both plain-text and base64url-encoded forms), Protocol = IPFS-Arweave-Bridge
-// (both forms).  The dual-value matching handles both legacy plain-text
-// tags and goar chunked-upload base64url-encoded tags.
+// Filters: Root-CID exact match (both plain-text and base64url-encoded forms
+// for backward compatibility with older chunked uploads), Content-Type =
+// application/vnd.ipld.car (both forms), Protocol = IPFS-Arweave-Bridge
+// (both forms).
 func (gc *GatewayClient) QueryExistingCARs(ctx context.Context, rootCID string, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 5
@@ -878,11 +878,12 @@ func (gc *GatewayClient) QueryExistingCARs(ctx context.Context, rootCID string, 
 	// transactions where goar stores tags encoded).
 	protocolB64 := base64.RawURLEncoding.EncodeToString([]byte("IPFS-Arweave-Bridge"))
 	contentTypeB64 := base64.RawURLEncoding.EncodeToString([]byte("application/vnd.ipld.car"))
+	rootCIDB64 := base64.RawURLEncoding.EncodeToString([]byte(rootCID))
 
 	query := fmt.Sprintf(`{
 		transactions(
 			tags: [
-				{ name: "Root-CID", values: ["%s"] },
+				{ name: "Root-CID", values: ["%s", "%s"] },
 				{ name: "Content-Type", values: ["application/vnd.ipld.car", "%s"] },
 				{ name: "Protocol", values: ["IPFS-Arweave-Bridge", "%s"] }
 			],
@@ -893,7 +894,7 @@ func (gc *GatewayClient) QueryExistingCARs(ctx context.Context, rootCID string, 
 				node { id }
 			}
 		}
-	}`, rootCID, contentTypeB64, protocolB64, limit)
+	}`, rootCID, rootCIDB64, contentTypeB64, protocolB64, limit)
 
 	graphqlURL := gc.GatewayURL + "/graphql"
 	payload := map[string]string{"query": query}

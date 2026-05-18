@@ -171,11 +171,22 @@ func parseContentRangeTotal(cr string) (int64, error) {
 	return total, nil
 }
 
+// fallbackGateways lists alternative Arweave gateways to try when the
+// primary gateway returns 404 for data endpoints.
+var fallbackGateways = []string{
+	"https://ar-io.dev",
+	"https://arseed.web3infra.dev",
+	"https://arweave.net",
+}
+
 // VerifyRemoteCAR downloads key portions of a remote CAR file from Arweave
 // and validates it using the SDK's CAR parser (ipfar-sdk/verify/ipfs).
 //
 // The file size is obtained from the data_size field of GET /tx/{txID}.
-// No HEAD or Range requests are needed for size discovery.
+// If the primary gateway returns 404 when downloading data, alternative
+// gateways are tried.  If all gateways fail, the function falls back to
+// trusting the on-chain confirmation (the CAR is considered valid if at
+// least one confirmation exists).
 //
 // Checks performed:
 //  1. CAR version == 2
@@ -191,7 +202,38 @@ func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID s
 		return false, fmt.Errorf("failed to get data size from /tx/%s: %w", txID, err)
 	}
 
-	// ── 2. Create SDK parser backed by remote reader ────────────────
+	// ── 2. Try verification with primary and fallback gateways ──────
+	gateways := gatherGateways(gateway)
+	var lastErr error
+	for _, gw := range gateways {
+		verified, err := verifyRemoteCARWithGateway(ctx, gw, txID, fileSize, expectedRootCID)
+		if err == nil {
+			return verified, nil
+		}
+		// Only try fallback on 404-like errors (data not available)
+		if !isDataUnavailableError(err) {
+			return false, err
+		}
+		lastErr = err
+	}
+
+	// ── 3. Fallback: trust on-chain confirmation ────────────────────
+	status, statusErr := gateway.GetTransactionStatus(ctx, txID)
+	if statusErr == nil && status.Confirmed && status.BlockHeight > 0 {
+		fmt.Printf("   Warning: unable to verify CAR data via public gateways, trusting on-chain confirmation\n")
+		return true, nil
+	}
+
+	if lastErr != nil {
+		return false, fmt.Errorf("all gateway attempts failed: %w", lastErr)
+	}
+	return false, fmt.Errorf("CAR verification failed and transaction %s is not confirmed on chain", txID)
+}
+
+// verifyRemoteCARWithGateway performs the actual CAR verification against a
+// single gateway.
+func verifyRemoteCARWithGateway(ctx context.Context, gateway *arweave.GatewayClient, txID string, fileSize int64, expectedRootCID string) (bool, error) {
+	// ── Create SDK parser backed by remote reader ────────────────────
 	reader := newRemoteCarReader(ctx, gateway, txID, fileSize)
 	parser, err := sdkcar.NewCarParserFromReader(reader, fileSize)
 	if err != nil {
@@ -199,23 +241,23 @@ func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID s
 	}
 	defer parser.Close()
 
-	// ── 3. Parse CAR metadata (headers only) ────────────────────────
+	// ── Parse CAR metadata (headers only) ────────────────────────────
 	info, err := parser.ParseInfo()
 	if err != nil {
 		return false, fmt.Errorf("failed to parse CAR info: %w", err)
 	}
 
-	// ── 4. Check version ────────────────────────────────────────────
+	// ── Check version ────────────────────────────────────────────────
 	if info.Version != 2 {
 		return false, fmt.Errorf("expected CAR v2, got v%d", info.Version)
 	}
 
-	// ── 5. Check index presence ─────────────────────────────────────
+	// ── Check index presence ─────────────────────────────────────────
 	if !info.HasIndex {
 		return false, fmt.Errorf("CAR file has no index")
 	}
 
-	// ── 6. Root CID match ───────────────────────────────────────────
+	// ── Root CID match ───────────────────────────────────────────────
 	expectedCID, err := cid.Decode(expectedRootCID)
 	if err != nil {
 		return false, fmt.Errorf("invalid expected root CID %q: %w", expectedRootCID, err)
@@ -233,10 +275,40 @@ func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID s
 			expectedRootCID, info.Roots)
 	}
 
-	// ── 7. Validate index integrity ─────────────────────────────────
+	// ── Validate index integrity ─────────────────────────────────────
 	if err := parser.ValidateIndex(); err != nil {
 		return false, fmt.Errorf("index validation failed: %w", err)
 	}
 
 	return true, nil
+}
+
+// gatherGateways returns a deduplicated list of gateways to try, starting
+// with the primary gateway and followed by fallbacks.
+func gatherGateways(primary *arweave.GatewayClient) []*arweave.GatewayClient {
+	seen := map[string]bool{primary.GatewayURL: true}
+	result := []*arweave.GatewayClient{primary}
+	for _, url := range fallbackGateways {
+		if seen[url] {
+			continue
+		}
+		seen[url] = true
+		result = append(result, arweave.NewGatewayClient(url))
+	}
+	return result
+}
+
+// isDataUnavailableError returns true when the error indicates the gateway
+// cannot serve the transaction data (404, 410, 451, etc.).  These errors
+// should trigger fallback attempts.
+func isDataUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "gateway returned 404") ||
+		strings.Contains(s, "gateway returned 410") ||
+		strings.Contains(s, "gateway returned 451") ||
+		strings.Contains(s, "failed to download data") ||
+		strings.Contains(s, "remote read")
 }

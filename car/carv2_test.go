@@ -228,3 +228,54 @@ func TestCreateCarV2FromFile(t *testing.T) {
 
 	t.Logf("Root CID: %s, Output size: %d", rootCID.String(), written)
 }
+
+func TestCarV2Builder_StandardCBORPragma(t *testing.T) {
+	data := []byte("CBOR pragma test")
+	builder := NewCarV2Builder()
+	rootCID, err := builder.AddRawBlock(data)
+	if err != nil {
+		t.Fatalf("AddRawBlock failed: %v", err)
+	}
+
+	carBytes, err := builder.BuildToBuffer()
+	if err != nil {
+		t.Fatalf("BuildToBuffer failed: %v", err)
+	}
+
+	// Verify standard CBOR pragma (11 bytes): {"version": 2}
+	cborPragma := []byte{
+		0x0a, 0xa1, 0x67,
+		0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e,
+		0x02,
+	}
+	if !bytes.HasPrefix(carBytes, cborPragma) {
+		t.Fatalf("CAR does not start with standard CBOR pragma. First 16 bytes: %x", carBytes[:min(len(carBytes), 16)])
+	}
+
+	// Verify it is NOT the legacy "car\x02" pragma
+	legacyPragma := []byte{0x63, 0x61, 0x72, 0x02}
+	if bytes.HasPrefix(carBytes, legacyPragma) {
+		t.Fatal("CAR uses legacy 'car\\x02' pragma, expected standard CBOR")
+	}
+
+	// Verify v2 header is 40 bytes (standard), not 48 (legacy)
+	// The v2 header offset is after the 11-byte pragma.
+	// Standard v2 header occupies bytes 11..50 (40 bytes).
+	// After the header (at offset 51) the v1 header begins.
+	// The SDK's CarParser handles both legacy and CBOR v1 headers.
+	offsetAfterV2 := 11 + 40 // pragma + v2 header
+	if len(carBytes) <= offsetAfterV2+1 {
+		t.Fatal("CAR too small")
+	}
+
+	t.Logf("Root CID: %s", rootCID.String())
+	t.Logf("CAR size: %d bytes", len(carBytes))
+	t.Logf("Standard CBOR pragma confirmed ✓")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

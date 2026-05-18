@@ -204,12 +204,11 @@ func (u *Uploader) uploadCarRaw(ctx context.Context, result *UploadResult, carBy
 		return nil
 	}
 
-	// Compute PoW (first pass with empty data_txid)
-	if pow.NeedsPoW(result.DataSize) {
-		if err := u.computePoWFirstPass(ctx, result, cachePath); err != nil {
-			return err
-		}
-	} else {
+	// PoW is deferred until after the CAR tx is confirmed (see
+	// uploadCarRawDirect / uploadCarRawChunked).  We cannot compute
+	// it here because the password = root_cid + data_txid and the
+	// real data_txid is not known until after submission.
+	if !pow.NeedsPoW(result.DataSize) {
 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
 	}
 
@@ -287,9 +286,9 @@ func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult,
 	result.DataHeight = status.BlockHeight
 	fmt.Printf("   CAR confirmed at height=%d\n", status.BlockHeight)
 
-	// Recompute PoW with actual data_txid
+	// Compute PoW now that we have the real data_txid
 	if pow.NeedsPoW(result.DataSize) {
-		if err := u.recomputePoW(ctx, result, cachePath); err != nil {
+		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
 			return err
 		}
 	}
@@ -321,9 +320,9 @@ func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult
 	result.DataHeight = status.BlockHeight
 	fmt.Printf("   CAR confirmed at height=%d\n", status.BlockHeight)
 
-	// Recompute PoW with actual data_txid
+	// Compute PoW now that we have the real data_txid
 	if pow.NeedsPoW(result.DataSize) {
-		if err := u.recomputePoW(ctx, result, cachePath); err != nil {
+		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
 			return err
 		}
 	}
@@ -674,45 +673,6 @@ func parseSubmittedAt(s string) time.Time {
 // PoW helpers (unchanged)
 // =============================================================================
 
-// computePoWFirstPass computes PoW with empty data_txid (for raw mode).
-func (u *Uploader) computePoWFirstPass(ctx context.Context, result *UploadResult, cachePath string) error {
-	powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
-
-	if cachedSalt, ok := pow.LoadPoWCache(cachePath, result.RootCID, ""); ok {
-		result.PoW = cachedSalt
-		fmt.Printf("   PoW loaded from cache (%s) — salt=%s\n", cachePath, cachedSalt)
-		return nil
-	}
-
-	fmt.Printf("   Computing PoW (%d workers)", powWorkers)
-	var lastPrint time.Time
-	var totalAttempts uint64
-	progress := func(info pow.ProgressInfo) {
-		totalAttempts = info.Attempts
-		now := time.Now()
-		if info.Attempts == 0 || now.Sub(lastPrint) < time.Second {
-			return
-		}
-		lastPrint = now
-		reportPoWProgress("Computing", powWorkers, info)
-	}
-
-	start := time.Now()
-	powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, "", u.cfg.PoWWorkers, progress)
-	elapsed := time.Since(start)
-	if err != nil {
-		return fmt.Errorf("PoW computation failed: %w", err)
-	}
-	result.PoW = powSalt
-	fmt.Printf("\r   PoW completed: %s hashes in %.1fs — salt=%s                                         \n",
-		pow.FormatNumber(totalAttempts), elapsed.Seconds(), powSalt)
-
-	if saveErr := pow.SavePoWCache(cachePath, result.RootCID, "", powSalt); saveErr != nil {
-		fmt.Fprintf(os.Stderr, "   Warning: failed to save PoW cache: %v\n", saveErr)
-	}
-	return nil
-}
-
 // computePoWSinglePass computes PoW with the already-known data_txid (for bundle mode).
 func (u *Uploader) computePoWSinglePass(ctx context.Context, result *UploadResult, cachePath string) error {
 	powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
@@ -752,57 +712,13 @@ func (u *Uploader) computePoWSinglePass(ctx context.Context, result *UploadResul
 	return nil
 }
 
-// recomputePoW recomputes PoW with the actual data_txid (second pass for raw).
-func (u *Uploader) recomputePoW(ctx context.Context, result *UploadResult, cachePath string) error {
-	powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
-
-	if cachedSalt, ok := pow.LoadPoWCache(cachePath, result.RootCID, result.DataTXID); ok {
-		result.PoW = cachedSalt
-		fmt.Printf("   PoW loaded from cache (%s) — salt=%s\n", cachePath, cachedSalt)
-		return nil
-	}
-
-	fmt.Printf("   Recomputing PoW with data_txid (%d workers)", powWorkers)
-	var lastPrint time.Time
-	var totalAttempts uint64
-	progress := func(info pow.ProgressInfo) {
-		totalAttempts = info.Attempts
-		now := time.Now()
-		if info.Attempts == 0 || now.Sub(lastPrint) < time.Second {
-			return
-		}
-		lastPrint = now
-		reportPoWProgress("Recomputing", powWorkers, info)
-	}
-
-	start := time.Now()
-	powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers, progress)
-	elapsed := time.Since(start)
-	if err != nil {
-		return fmt.Errorf("PoW recomputation failed: %w", err)
-	}
-	result.PoW = powSalt
-	fmt.Printf("\r   PoW completed: %s hashes in %.1fs — salt=%s                                         \n",
-		pow.FormatNumber(totalAttempts), elapsed.Seconds(), powSalt)
-
-	if saveErr := pow.SavePoWCache(cachePath, result.RootCID, result.DataTXID, powSalt); saveErr != nil {
-		fmt.Fprintf(os.Stderr, "   Warning: failed to save PoW cache: %v\n", saveErr)
-	}
-	return nil
-}
-
 // =============================================================================
 // Legacy methods (kept for backward compatibility)
 // =============================================================================
 
 // uploadRaw handles the raw Arweave transaction flow (legacy, without state).
 func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes []byte, cachePath string, arTags []arweave.Tag) (*UploadResult, error) {
-	if pow.NeedsPoW(result.DataSize) {
-		if err := u.computePoWFirstPass(ctx, result, cachePath); err != nil {
-			result.Error = err
-			return result, result.Error
-		}
-	} else {
+	if !pow.NeedsPoW(result.DataSize) {
 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
 	}
 
@@ -817,7 +733,7 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 	fmt.Printf("   CAR uploaded: %s (height=%d)\n", result.DataTXID, result.DataHeight)
 
 	if pow.NeedsPoW(result.DataSize) {
-		if err := u.recomputePoW(ctx, result, cachePath); err != nil {
+		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
 			result.Error = err
 			return result, result.Error
 		}
@@ -925,11 +841,8 @@ func (u *Uploader) uploadCrossBundle(ctx context.Context, result *UploadResult, 
 	carItemID := base64.RawURLEncoding.EncodeToString(carItem.ID)
 	result.DataTXID = carItemID
 
-	if pow.NeedsPoW(result.DataSize) {
-		if err := u.computePoWFirstPass(ctx, result, cachePath); err != nil {
-			result.Error = err
-			return result, result.Error
-		}
+	if !pow.NeedsPoW(result.DataSize) {
+		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
 	}
 
 	bundleData, err := buildSingleItemBundle(carItem)
@@ -954,7 +867,7 @@ func (u *Uploader) uploadCrossBundle(ctx context.Context, result *UploadResult, 
 	fmt.Printf("   Bundle confirmed at height=%d\n", result.DataHeight)
 
 	if pow.NeedsPoW(result.DataSize) {
-		if err := u.recomputePoW(ctx, result, cachePath); err != nil {
+		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
 			result.Error = err
 			return result, result.Error
 		}
@@ -1127,9 +1040,14 @@ func (u *Uploader) dedupCheckCAR(ctx context.Context, result *UploadResult, stat
 		verified, verifyErr := VerifyRemoteCAR(ctx, u.cfg.Gateway, txID, result.RootCID)
 		if verifyErr == nil && verified {
 			fmt.Printf("   CAR verified, reusing existing transaction\n")
+			// Extract real block height from transaction status
+			realHeight := 0
+			if status, err := u.cfg.Gateway.GetTransactionStatus(ctx, txID); err == nil {
+				realHeight = status.BlockHeight
+			}
 			state.CarTXID = txID
 			state.CarConfirmed = true
-			state.CarHeight = 0 // unknown, but confirmed
+			state.CarHeight = realHeight
 			if err := state.TransitionTo(StatusCarConfirmed); err != nil {
 				state.Status = StatusCarConfirmed
 			}

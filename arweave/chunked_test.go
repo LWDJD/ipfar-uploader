@@ -790,3 +790,175 @@ func TestReadFullAt_Error(t *testing.T) {
 	}
 	t.Logf("Got expected error: %v", err)
 }
+
+// TestBuildGoarTransaction_TagsNotBase64 verifies that the goar Transaction
+// returned by buildGoarTransaction has Base64-encoded tags (required for
+// goar's SHA-384 deep hash signing), and that after signing the caller
+// replaces them with plaintext.  This test only checks the buildGoarTransaction
+// output; the plaintext replacement is verified in TestUploadDataChunked_TagsPlaintext.
+func TestBuildGoarTransaction_TagsAreBase64(t *testing.T) {
+	tags := []Tag{
+		{Name: "Root-CID", Value: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"},
+		{Name: "Content-Type", Value: "application/vnd.ipld.car"},
+	}
+	tx := buildGoarTransaction("owner", 100, tags, "1000", "anchor")
+
+	if len(tx.Tags) != 2 {
+		t.Fatalf("expected 2 tags, got %d", len(tx.Tags))
+	}
+
+	// Tags in the goar Transaction MUST be Base64-encoded (otherwise goar's
+	// deepHashStr will fail to decode them and produce wrong signatures).
+	for i, tag := range tx.Tags {
+		// A plaintext tag like "Root-CID" is NOT valid Base64, so decoding
+		// should succeed only if it's actually Base64-encoded.
+		decodedName, err := base64URLDecode(tag.Name)
+		if err != nil {
+			t.Errorf("tag[%d].Name %q is not valid Base64: %v", i, tag.Name, err)
+		} else {
+			// The decoded value should match the original plaintext
+			if string(decodedName) != tags[i].Name {
+				t.Errorf("tag[%d].Name decoded to %q, expected %q", i, string(decodedName), tags[i].Name)
+			}
+		}
+		decodedValue, err := base64URLDecode(tag.Value)
+		if err != nil {
+			t.Errorf("tag[%d].Value %q is not valid Base64: %v", i, tag.Value, err)
+		} else {
+			if string(decodedValue) != tags[i].Value {
+				t.Errorf("tag[%d].Value decoded to %q, expected %q", i, string(decodedValue), tags[i].Value)
+			}
+		}
+	}
+	t.Log("buildGoarTransaction correctly Base64-encodes tags for goar signing")
+}
+
+// TestUploadDataChunked_TagsPlaintext verifies that after chunked upload the
+// transaction tags submitted to the gateway are plaintext (not Base64-encoded).
+// This uses the mock server which captures the submitted transaction.
+func TestUploadDataChunked_TagsPlaintext(t *testing.T) {
+	// Use a custom mock that captures the submitted tx tags
+	var capturedTags []goartypes.Tag
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/chunk" && r.Method == "POST":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"ok":true}`))
+		case r.URL.Path == "/tx" && r.Method == "POST":
+			var tx map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			// Capture the tags from the submitted transaction
+			if rawTags, ok := tx["tags"]; ok {
+				if tagList, ok := rawTags.([]interface{}); ok {
+					for _, item := range tagList {
+						if tagMap, ok := item.(map[string]interface{}); ok {
+							name, _ := tagMap["name"].(string)
+							value, _ := tagMap["value"].(string)
+							capturedTags = append(capturedTags, goartypes.Tag{Name: name, Value: value})
+						}
+					}
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"plaintext-tags-tx-id"}`))
+		case r.URL.Path == "/price/0":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("1000"))
+		case r.URL.Path == "/tx_anchor":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`"mock-anchor"`))
+		case strings.HasPrefix(r.URL.Path, "/raw/") && r.Method == "GET":
+			dataSize := ChunkSize + 100
+			w.Header().Set("Content-Type", "application/octet-stream")
+			start := int64(0)
+			end := int64(dataSize) - 1
+			if rng := r.Header.Get("Range"); rng != "" {
+				fmt.Sscanf(rng, "bytes=%d-%d", &start, &end)
+				if end >= int64(dataSize) {
+					end = int64(dataSize) - 1
+				}
+				w.WriteHeader(http.StatusPartialContent)
+			}
+			chunk := make([]byte, end-start+1)
+			for i := int64(0); i < int64(len(chunk)); i++ {
+				chunk[i] = byte((start + i) % 256)
+			}
+			w.Write(chunk)
+		case strings.HasPrefix(r.URL.Path, "/tx/") && r.Method == "GET":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"block_height":2000000,"block_indep_hash":"mock-hash"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewGatewayClient(server.URL)
+
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+	nBytes := privKey.N.Bytes()
+	wallet := &Wallet{
+		PrivateKey: privKey,
+		Owner:      base64.RawURLEncoding.EncodeToString(nBytes),
+	}
+
+	data := make([]byte, ChunkSize+100)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	// IPFAR-spec tag values — must appear exactly as-is on chain.
+	tags := []Tag{
+		{Name: "Root-CID", Value: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"},
+		{Name: "Content-Type", Value: "application/vnd.ipld.car"},
+		{Name: "Protocol", Value: "IPFS-Arweave-Bridge"},
+		{Name: "Data-Size", Value: "12345"},
+	}
+
+	_, _, err = client.UploadDataChunked(context.Background(), wallet, data, tags)
+	if err != nil {
+		t.Fatalf("UploadDataChunked failed: %v", err)
+	}
+
+	if len(capturedTags) == 0 {
+		t.Fatal("no tags captured from submitted transaction")
+	}
+
+	// Build a lookup map from the expected tags
+	expected := map[string]string{}
+	for _, tag := range tags {
+		expected[tag.Name] = tag.Value
+	}
+
+	for _, captured := range capturedTags {
+		expectedVal, ok := expected[captured.Name]
+		if !ok {
+			t.Errorf("unexpected tag name %q in submitted transaction", captured.Name)
+			continue
+		}
+		if captured.Value != expectedVal {
+			// Check if the value is the Base64-encoded form of the expected value
+			// (which would be a bug)
+			encoded := base64.RawURLEncoding.EncodeToString([]byte(expectedVal))
+			if captured.Value == encoded {
+				t.Errorf("tag %q value is Base64-encoded: got %q, expected plaintext %q",
+					captured.Name, captured.Value, expectedVal)
+			} else {
+				t.Errorf("tag %q value mismatch: got %q, expected %q",
+					captured.Name, captured.Value, expectedVal)
+			}
+		}
+	}
+
+	t.Logf("Captured %d tags, all plaintext ✓", len(capturedTags))
+	for _, tag := range capturedTags {
+		t.Logf("  %s: %s", tag.Name, tag.Value)
+	}
+}

@@ -14,7 +14,20 @@ import (
 	"github.com/multiformats/go-varint"
 )
 
-var carv2Pragma = []byte{0x63, 0x61, 0x72, 0x02} // "car\x02"
+// carv2Pragma is the standard CBOR-encoded CAR v2 pragma: {"version": 2}
+// Spec: https://ipld.io/specs/transport/car/carv2/
+var carv2Pragma = []byte{
+	0x0a,                                     // uint(10) — outer CBOR map length
+	0xa1,                                     // map(1)
+	0x67,                                     // string(7)
+	0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, // "version"
+	0x02,                                     // uint(2)
+}
+
+// carv2LegacyPragma is the legacy non‑standard "car\x02" pragma, kept for
+// backward-compatible reading only.  New CARs are always written with the
+// standard CBOR pragma above.
+var carv2LegacyPragma = []byte{0x63, 0x61, 0x72, 0x02} // "car\x02"
 
 // CarV2Builder builds CAR v2 files from raw data blocks.
 type CarV2Builder struct {
@@ -84,20 +97,19 @@ func (b *CarV2Builder) Build(w io.Writer) (int64, error) {
 		indexBytes = append(indexBytes, make([]byte, padLen)...)
 	}
 
-	// Compute offsets
-	pragmaSize := int64(4)
-	v2HeaderSize := int64(48)
+	// Compute offsets.
+	// Standard CBOR pragma (11 bytes) + 40-byte v2 header.
+	pragmaSize := int64(len(carv2Pragma))
+	v2HeaderSize := int64(40)
 	v1HeaderSize := int64(len(v1Header))
 	dataOffset := pragmaSize + v2HeaderSize
 	dataSize := v1HeaderSize + int64(dataBuf.Len()) // includes v1 header + blocks
 	indexOffset := dataOffset + dataSize
-	indexSize := len(indexBytes)
 
 	v2Header := b.buildV2Header(
 		uint64(dataOffset),
 		uint64(dataSize),
 		uint64(indexOffset),
-		uint64(indexSize),
 	)
 
 	// Write everything
@@ -180,8 +192,17 @@ func (b *CarV2Builder) buildV1Header() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func (b *CarV2Builder) buildV2Header(dataOffset, dataSize, indexOffset, indexSize uint64) []byte {
-	hdr := make([]byte, 48)
+// buildV2Header builds the standard CAR v2 header (40 bytes):
+//
+//	Characteristics [16]byte  — all zeros
+//	DataOffset      uint64 LE
+//	DataSize        uint64 LE
+//	IndexOffset     uint64 LE
+//
+// Note: IndexSize is NOT stored in the standard header; it is derived from
+// file_size - IndexOffset by the reader.
+func (b *CarV2Builder) buildV2Header(dataOffset, dataSize, indexOffset uint64) []byte {
+	hdr := make([]byte, 40)
 	// Characteristics (16 bytes, all zeros for now)
 	// DataOffset (8 bytes LE)
 	binary.LittleEndian.PutUint64(hdr[16:24], dataOffset)
@@ -189,8 +210,6 @@ func (b *CarV2Builder) buildV2Header(dataOffset, dataSize, indexOffset, indexSiz
 	binary.LittleEndian.PutUint64(hdr[24:32], dataSize)
 	// IndexOffset (8 bytes LE)
 	binary.LittleEndian.PutUint64(hdr[32:40], indexOffset)
-	// IndexSize (8 bytes LE)
-	binary.LittleEndian.PutUint64(hdr[40:48], indexSize)
 	return hdr
 }
 
