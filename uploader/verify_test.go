@@ -2,8 +2,8 @@
 package uploader
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net/http"
@@ -204,6 +204,156 @@ func TestVerifyRemoteCAR_MultipleRequests(t *testing.T) {
 }
 
 // =============================================================================
+// Tests for parseV2Header and parseContentRangeTotal
+// =============================================================================
+
+func TestParseV2Header_Legacy(t *testing.T) {
+	carBytes, _, err := car.CreateCarV2FromBytes([]byte("test data for header parsing"))
+	if err != nil {
+		t.Fatalf("failed to create CAR v2: %v", err)
+	}
+
+	size, err := parseV2Header(carBytes[:200])
+	if err != nil {
+		t.Fatalf("parseV2Header failed: %v", err)
+	}
+	if size != int64(len(carBytes)) {
+		t.Fatalf("expected derived size=%d, got %d", len(carBytes), size)
+	}
+	t.Logf("legacy header: derived total size = %d (actual = %d)", size, len(carBytes))
+}
+
+func TestParseV2Header_CBOR(t *testing.T) {
+	carBytes, _ := buildCBORFormatCAR(t)
+
+	size, err := parseV2Header(carBytes[:200])
+	if err != nil {
+		t.Fatalf("parseV2Header failed: %v", err)
+	}
+	if size != 0 {
+		t.Fatalf("expected derived size=0 for CBOR, got %d", size)
+	}
+	t.Log("CBOR header: correctly returned 0 (no IndexSize in header)")
+}
+
+func TestParseV2Header_TooSmall(t *testing.T) {
+	_, err := parseV2Header(make([]byte, 5))
+	if err == nil {
+		t.Fatal("expected error for tiny buffer")
+	}
+	t.Logf("correctly rejected tiny buffer: %v", err)
+}
+
+func TestParseV2Header_UnknownPragma(t *testing.T) {
+	buf := make([]byte, 200)
+	buf[0] = 0xde
+	buf[1] = 0xad
+	_, err := parseV2Header(buf)
+	if err == nil {
+		t.Fatal("expected error for unknown pragma")
+	}
+	t.Logf("correctly rejected unknown pragma: %v", err)
+}
+
+func TestParseContentRangeTotal_Valid(t *testing.T) {
+	total, err := parseContentRangeTotal("bytes 0-199/1048746")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if total != 1048746 {
+		t.Fatalf("expected 1048746, got %d", total)
+	}
+}
+
+func TestParseContentRangeTotal_Star(t *testing.T) {
+	_, err := parseContentRangeTotal("bytes 0-199/*")
+	if err == nil {
+		t.Fatal("expected error for unknown total (*)")
+	}
+	t.Logf("correctly rejected * total: %v", err)
+}
+
+func TestParseContentRangeTotal_Missing(t *testing.T) {
+	_, err := parseContentRangeTotal("")
+	if err == nil {
+		t.Fatal("expected error for empty Content-Range")
+	}
+	t.Logf("correctly rejected empty Content-Range: %v", err)
+}
+
+func TestParseContentRangeTotal_Malformed(t *testing.T) {
+	_, err := parseContentRangeTotal("bytes 0-199")
+	if err == nil {
+		t.Fatal("expected error for malformed Content-Range")
+	}
+	t.Logf("correctly rejected malformed Content-Range: %v", err)
+}
+
+// TestVerifyRemoteCAR_CrossCheckSizeMismatch tests that when a legacy-format
+// CAR has a header-derived size that doesn't match Content-Range, an error
+// is returned (truncated file detection).
+func TestVerifyRemoteCAR_CrossCheckSizeMismatch(t *testing.T) {
+	carBytes, rootCID, err := car.CreateCarV2FromBytes([]byte("cross-check test data"))
+	if err != nil {
+		t.Fatalf("failed to create CAR v2: %v", err)
+	}
+
+	// Build a mock that returns a Content-Range total that doesn't match
+	// the header-derived size (simulating a truncated file).
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		if rangeHeader != "" {
+			var start, end int64
+			_, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+			if err != nil {
+				_, err = fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				end = int64(len(carBytes)) - 1
+			}
+			if start >= int64(len(carBytes)) {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			if end >= int64(len(carBytes)) {
+				end = int64(len(carBytes)) - 1
+			}
+
+			// Lie about total size — add 100 bytes
+			fakeTotal := len(carBytes) + 100
+			w.Header().Set("Content-Range",
+				fmt.Sprintf("bytes %d-%d/%d", start, end, fakeTotal))
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(carBytes[start : end+1])
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(carBytes)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(carBytes)
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	gateway := arweave.NewGatewayClient(server.URL)
+	txID := "mock-tx-id"
+
+	// The header says one size, Content-Range says another → should fail
+	verified, err := VerifyRemoteCAR(context.Background(), gateway, txID, rootCID.String())
+	if err == nil {
+		t.Fatal("expected error for size mismatch, got nil")
+	}
+	if verified {
+		t.Fatal("expected verified=false for size mismatch")
+	}
+	t.Logf("correctly detected size mismatch: %v", err)
+}
+
+// =============================================================================
 // Helpers for building CBOR-format CAR v2 files
 // =============================================================================
 
@@ -238,17 +388,6 @@ func buildCBORFormatCAR(t *testing.T) ([]byte, cid.Cid) {
 
 	// Build CBOR v1 header:
 	// {"roots": [<CID>], "version": 1}
-	// CBOR layout:
-	//   0xa2 = map(2)
-	//     0x65 72 6f 6f 74 73 = "roots" (string of length 5)
-	//     0x81 = array(1)
-	//       0xd8 0x2a = tag(42)
-	//       0x58 0x22 = bytes(34) — CID bytes with multibase prefix
-	//       0x00 <34 bytes of CID>  — multibase identity prefix + raw CID
-	//     0x67 76 65 72 73 69 6f 6e = "version" (string of length 7)
-	//     0x01 = uint(1)
-
-	// Build CBOR v1 header content
 	cborContent := buildCBORV1Header(rootCIDBytes)
 
 	// CBOR v1 header: varint(CBOR length) + CBOR data
@@ -256,7 +395,6 @@ func buildCBORFormatCAR(t *testing.T) ([]byte, cid.Cid) {
 
 	// Build CBOR v2 pragma + header
 	// Standard pragma: 0x0a (uint(10) — outer CBOR length), then CBOR: {"version": 2}
-	// This is 11 bytes: 0a a1 67 76 65 72 73 69 6f 6e 02
 	cborPragma := []byte{
 		0x0a,                                           // uint(10) — outer CBOR map length
 		0xa1,                                           // map(1)
@@ -274,9 +412,6 @@ func buildCBORFormatCAR(t *testing.T) ([]byte, cid.Cid) {
 	indexOffset := dataOffset + dataSize
 
 	// Build a minimal valid index
-	// Index entries: varint(entryLen) + varint(cidLen) + CID + varint(offset)
-	// offset is relative to data section start, and in our case the v1 header is part of data section
-	// so the block offset = v1HeaderLen
 	indexEntryContent := append(encodeVarint(uint64(len(rootCIDBytes))), rootCIDBytes...)
 	indexEntryContent = append(indexEntryContent, encodeVarint(v1HeaderLen)...)
 	indexBuf := append(encodeVarint(uint64(len(indexEntryContent))), indexEntryContent...)
@@ -292,7 +427,6 @@ func buildCBORFormatCAR(t *testing.T) ([]byte, cid.Cid) {
 	binary.LittleEndian.PutUint64(v2Header[16:24], dataOffset)
 	binary.LittleEndian.PutUint64(v2Header[24:32], dataSize)
 	binary.LittleEndian.PutUint64(v2Header[32:40], indexOffset)
-	// Note: IndexSize is NOT in standard header — it's computed as fileSize - indexOffset
 
 	var carBuf bytes.Buffer
 	carBuf.Write(cborPragma)
@@ -303,7 +437,6 @@ func buildCBORFormatCAR(t *testing.T) ([]byte, cid.Cid) {
 
 	result := carBuf.Bytes()
 
-	// Verify the fileSize matches
 	_ = indexSize
 	_ = result
 
@@ -357,183 +490,4 @@ func encodeVarint(v uint64) []byte {
 	}
 	buf = append(buf, byte(v))
 	return buf
-}
-
-// =============================================================================
-// Tests for getRemoteFileSize fallback strategies
-// =============================================================================
-
-// newMockGatewayForSize starts a server whose "/" handler can be
-// customised via the supplied handler function.  Returns the client,
-// a txID and a cleanup.
-func newMockGatewayForSize(t *testing.T, handler http.HandlerFunc) (*arweave.GatewayClient, string, func()) {
-	t.Helper()
-
-	server := httptest.NewServer(handler)
-	client := arweave.NewGatewayClient(server.URL)
-	txID := "mock-tx-id"
-	cleanup := func() { server.Close() }
-	return client, txID, cleanup
-}
-
-// TestGetRemoteFileSize_HeadWorks verifies the happy path (strategy 1).
-func TestGetRemoteFileSize_HeadWorks(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", "12345")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-	gateway, txID, cleanup := newMockGatewayForSize(t, handler)
-	defer cleanup()
-
-	size, err := getRemoteFileSize(context.Background(), gateway, txID)
-	if err != nil {
-		t.Fatalf("expected success, got: %v", err)
-	}
-	if size != 12345 {
-		t.Fatalf("expected size=12345, got %d", size)
-	}
-}
-
-// TestGetRemoteFileSize_HeadNoContentLength_FallsBackToRange verifies
-// that when HEAD returns no Content-Length we fall back to the Range
-// strategy (strategy 2).
-func TestGetRemoteFileSize_HeadNoContentLength_FallsBackToRange(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			// Simulate CDN that doesn't give Content-Length
-			w.Header().Set("Content-Length", "0")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if r.Method == http.MethodGet && r.Header.Get("Range") == "bytes=0-0" {
-			w.Header().Set("Content-Range", "bytes 0-0/99999")
-			w.Header().Set("Content-Length", "1")
-			w.WriteHeader(http.StatusPartialContent)
-			w.Write([]byte{0x00})
-			return
-		}
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-	gateway, txID, cleanup := newMockGatewayForSize(t, handler)
-	defer cleanup()
-
-	size, err := getRemoteFileSize(context.Background(), gateway, txID)
-	if err != nil {
-		t.Fatalf("expected success via Range fallback, got: %v", err)
-	}
-	if size != 99999 {
-		t.Fatalf("expected size=99999, got %d", size)
-	}
-}
-
-// TestGetRemoteFileSize_FallsBackToGet verifies strategy 3 (limited GET)
-// when both HEAD and Range strategies fail.
-func TestGetRemoteFileSize_FallsBackToGet(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", "0")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if r.Method == http.MethodGet && r.Header.Get("Range") != "" {
-			// Range also fails — return 200 without Content-Range
-			w.Header().Set("Content-Length", "1")
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte{0x00})
-			return
-		}
-		if r.Method == http.MethodGet {
-			// Strategy 3: full GET with Content-Length
-			w.Header().Set("Content-Length", "2048")
-			w.WriteHeader(http.StatusOK)
-			// Write partial body (but server already told us the size via header)
-			w.Write(make([]byte, 2048))
-			return
-		}
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-	gateway, txID, cleanup := newMockGatewayForSize(t, handler)
-	defer cleanup()
-
-	size, err := getRemoteFileSize(context.Background(), gateway, txID)
-	if err != nil {
-		t.Fatalf("expected success via GET fallback, got: %v", err)
-	}
-	if size != 2048 {
-		t.Fatalf("expected size=2048, got %d", size)
-	}
-}
-
-// TestGetRemoteFileSize_AllFail verifies the error path.
-func TestGetRemoteFileSize_AllFail(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", "0")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if r.Method == http.MethodGet && r.Header.Get("Range") != "" {
-			w.WriteHeader(http.StatusOK) // no Content-Range
-			return
-		}
-		if r.Method == http.MethodGet {
-			// No Content-Length header; write > 4 KiB so limited read can't
-			// reach EOF and the strategy fails.
-			w.Header().Del("Content-Length")
-			w.WriteHeader(http.StatusOK)
-			w.Write(make([]byte, 5*1024)) // 5 KiB > 4 KiB limit
-			return
-		}
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-	gateway, txID, cleanup := newMockGatewayForSize(t, handler)
-	defer cleanup()
-
-	_, err := getRemoteFileSize(context.Background(), gateway, txID)
-	if err == nil {
-		t.Fatal("expected error when all strategies fail")
-	}
-	t.Logf("correctly failed: %v", err)
-}
-
-// TestGetRemoteFileSize_RangeWithUnknownTotal verifies that a Range
-// response with "bytes 0-0/*" (unknown total) is treated as failure
-// and falls through to the next strategy.
-func TestGetRemoteFileSize_RangeUnknownTotal_FallsBackToGet(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Content-Length", "0")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if r.Method == http.MethodGet && r.Header.Get("Range") == "bytes=0-0" {
-			// Content-Range with unknown total (*)
-			w.Header().Set("Content-Range", "bytes 0-0/*")
-			w.Header().Set("Content-Length", "1")
-			w.WriteHeader(http.StatusPartialContent)
-			w.Write([]byte{0x00})
-			return
-		}
-		if r.Method == http.MethodGet {
-			w.Header().Set("Content-Length", "512")
-			w.WriteHeader(http.StatusOK)
-			w.Write(make([]byte, 512))
-			return
-		}
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-	gateway, txID, cleanup := newMockGatewayForSize(t, handler)
-	defer cleanup()
-
-	size, err := getRemoteFileSize(context.Background(), gateway, txID)
-	if err != nil {
-		t.Fatalf("expected success via GET fallback after Range with *, got: %v", err)
-	}
-	if size != 512 {
-		t.Fatalf("expected size=512, got %d", size)
-	}
 }

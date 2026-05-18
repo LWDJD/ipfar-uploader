@@ -2,10 +2,11 @@
 package uploader
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
-	"net/http"
 	"strconv"
 	"strings"
 
@@ -57,150 +58,128 @@ func (r *remoteCarReader) ReadAt(p []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
-// getRemoteFileSize fetches the total byte size of a remote transaction's
-// data from an Arweave gateway.  Several strategies are tried in order
-// because some CDN frontends (most notably arweave.net) do not return
-// Content-Length on HEAD requests against the /raw/ path.
+// carv2Pragma is the legacy non‑standard CAR v2 pragma.
+var carv2Pragma = []byte{0x63, 0x61, 0x72, 0x02} // "car\x02"
+
+// carv2SpecPragma is the CBOR-encoded CAR v2 pragma: {"version": 2}
+var carv2SpecPragma = []byte{
+	0x0a,                                     // uint(10) — outer CBOR length
+	0xa1,                                     // map(1)
+	0x67,                                     // string(7)
+	0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, // "version"
+	0x02,                                     // uint(2)
+}
+
+// parseV2Header validates the CAR v2 header bytes and returns the total
+// file size derived from the header fields (legacy format only).  For
+// standard CBOR format the returned size is 0 — the caller must obtain
+// the total size from the HTTP Content-Range header instead.
 //
-// Strategies (tried in order):
-//  1. HEAD /{txID}                       – read Content-Length
-//  2. GET  /{txID}  Range: bytes=0-0     – parse Content-Range
-//  3. GET  /{txID}  (limited to 4 KiB)   – read Content-Length or drain body
-func getRemoteFileSize(ctx context.Context, gateway *arweave.GatewayClient, txID string) (int64, error) {
-	url := gateway.GatewayURL + "/" + txID
-
-	// ── Strategy 1: HEAD ──────────────────────────────────────────────
-	if size, err := headFileSize(ctx, url); err == nil {
-		return size, nil
+// The function also checks that:
+//   - dataOffset is non-zero
+//   - indexOffset is non-zero (index is present)
+//   - data section fits before the index (legacy only)
+func parseV2Header(buf []byte) (derivedSize int64, err error) {
+	if len(buf) < 11 {
+		return 0, fmt.Errorf("buffer too small for CAR header: %d bytes", len(buf))
 	}
 
-	// ── Strategy 2: Range bytes=0-0 ───────────────────────────────────
-	if size, err := rangeFileSize(ctx, url); err == nil {
-		return size, nil
+	// ── Legacy format ("car\x02") ───────────────────────────────────
+	if bytes.Equal(buf[:4], carv2Pragma) {
+		if len(buf) < 52 {
+			return 0, fmt.Errorf("buffer too small for legacy v2 header (need 52, got %d)", len(buf))
+		}
+		hdr := buf[4:52] // 48-byte legacy header
+
+		dataOffset := binary.LittleEndian.Uint64(hdr[16:24])
+		dataSize := binary.LittleEndian.Uint64(hdr[24:32])
+		indexOffset := binary.LittleEndian.Uint64(hdr[32:40])
+		indexSize := binary.LittleEndian.Uint64(hdr[40:48])
+
+		if dataOffset == 0 {
+			return 0, fmt.Errorf("invalid data offset in legacy CAR v2 header")
+		}
+		if indexOffset == 0 || indexSize == 0 {
+			return 0, fmt.Errorf("CAR v2 has no index (indexOffset=%d, indexSize=%d)", indexOffset, indexSize)
+		}
+
+		total := int64(indexOffset + indexSize)
+
+		// Sanity: data section must fit before the index.
+		if int64(dataOffset+dataSize) > total {
+			return 0, fmt.Errorf("CAR v2 header: data section extends beyond file (dataEnd=%d, total=%d)",
+				dataOffset+dataSize, total)
+		}
+
+		return total, nil
 	}
 
-	// ── Strategy 3: limited GET ───────────────────────────────────────
-	if size, err := limitedGetFileSize(ctx, url); err == nil {
-		return size, nil
+	// ── Standard CBOR format ────────────────────────────────────────
+	if bytes.Equal(buf[:len(carv2SpecPragma)], carv2SpecPragma) {
+		if len(buf) < 51 {
+			return 0, fmt.Errorf("buffer too small for standard v2 header (need 51, got %d)", len(buf))
+		}
+		hdr := buf[11:51] // 40-byte standard header
+
+		dataOffset := binary.LittleEndian.Uint64(hdr[16:24])
+		indexOffset := binary.LittleEndian.Uint64(hdr[32:40])
+
+		if dataOffset == 0 {
+			return 0, fmt.Errorf("invalid data offset in standard CAR v2 header")
+		}
+		if indexOffset == 0 {
+			return 0, fmt.Errorf("CAR v2 has no index (indexOffset=0)")
+		}
+
+		// IndexSize is not in the header; size must come from Content-Range.
+		return 0, nil
 	}
 
-	return 0, fmt.Errorf("all strategies exhausted to get file size for %s", txID)
+	return 0, fmt.Errorf("unknown CAR pragma: %x", buf[:minInt(len(buf), 16)])
 }
 
-// headFileSize tries a HEAD request and returns Content-Length.
-func headFileSize(ctx context.Context, url string) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
-	if err != nil {
-		return 0, fmt.Errorf("HEAD: %w", err)
+// minInt returns the smaller of a and b.
+func minInt(a, b int) int {
+	if a < b {
+		return a
 	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("HEAD: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("HEAD returned %d", resp.StatusCode)
-	}
-
-	if resp.ContentLength <= 0 {
-		return 0, fmt.Errorf("HEAD: no Content-Length")
-	}
-
-	return resp.ContentLength, nil
+	return b
 }
 
-// rangeFileSize sends GET with Range: bytes=0-0 and parses the
-// Content-Range response header (format: "bytes 0-0/1048746").
-func rangeFileSize(ctx context.Context, url string) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return 0, fmt.Errorf("Range: %w", err)
-	}
-	req.Header.Set("Range", "bytes=0-0")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("Range: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Accept both 206 Partial Content and 200 OK (some servers ignore Range)
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("Range returned %d", resp.StatusCode)
-	}
-
-	cr := resp.Header.Get("Content-Range")
+// parseContentRangeTotal extracts the total file size from a Content-Range
+// header value like "bytes 0-199/1048746".  Returns an error if the header
+// is missing, malformed, or has an unknown total (*).
+func parseContentRangeTotal(cr string) (int64, error) {
 	if cr == "" {
-		return 0, fmt.Errorf("Range: no Content-Range header")
+		return 0, fmt.Errorf("Content-Range header missing")
 	}
-
-	// Content-Range format: "bytes start-end/total" or "bytes start-end/*"
 	slash := strings.LastIndexByte(cr, '/')
 	if slash < 0 {
-		return 0, fmt.Errorf("Range: malformed Content-Range %q", cr)
+		return 0, fmt.Errorf("malformed Content-Range %q", cr)
 	}
 	totalStr := cr[slash+1:]
 	if totalStr == "*" {
-		return 0, fmt.Errorf("Range: Content-Range has unknown total")
+		return 0, fmt.Errorf("Content-Range has unknown total (*)")
 	}
-
 	total, err := strconv.ParseInt(totalStr, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("Range: invalid Content-Range total %q: %w", totalStr, err)
+		return 0, fmt.Errorf("invalid Content-Range total %q: %w", totalStr, err)
 	}
 	if total <= 0 {
-		return 0, fmt.Errorf("Range: Content-Range total <= 0 (%d)", total)
+		return 0, fmt.Errorf("Content-Range total <= 0 (%d)", total)
 	}
-
 	return total, nil
-}
-
-// limitedGetFileSize issues a GET and reads at most 4 KiB from the body.
-// It first checks Content-Length; if missing, it uses io.LimitReader to
-// read up to 4 KiB.  If EOF is reached within the limit, the file size
-// is known exactly (totalBytesRead); otherwise we cannot determine the
-// size without downloading the whole file.
-func limitedGetFileSize(ctx context.Context, url string) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return 0, fmt.Errorf("GET: %w", err)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("GET: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("GET returned %d", resp.StatusCode)
-	}
-
-	// If the server gave us Content-Length, use it.
-	if resp.ContentLength > 0 {
-		return resp.ContentLength, nil
-	}
-
-	// Drain up to 4 KiB to see if the file is small enough to fully read.
-	const maxRead = 4 * 1024
-	limited := io.LimitReader(resp.Body, maxRead+1) // +1 to detect overflow
-	n, readErr := io.Copy(io.Discard, limited)
-	if readErr != nil {
-		return 0, fmt.Errorf("GET: read error: %w", readErr)
-	}
-
-	if n <= maxRead {
-		// Reached EOF within the limit — we read the entire file.
-		return n, nil
-	}
-
-	return 0, fmt.Errorf("GET: no Content-Length and file larger than %d bytes", maxRead)
 }
 
 // VerifyRemoteCAR downloads key portions of a remote CAR file from Arweave
 // and validates it using the SDK's CAR parser (ipfar-sdk/verify/ipfs).
+//
+// The file size is obtained from the Content-Range header of the initial
+// Range request (bytes 0–199), which also captures the CAR v2 header.
+// For legacy-format CARs the header-derived size is cross-checked against
+// the Content-Range total as a sanity measure.
+//
+// No HEAD request is needed; only standard Range requests are used.
 //
 // Checks performed:
 //  1. CAR version == 2
@@ -210,13 +189,31 @@ func limitedGetFileSize(ctx context.Context, url string) (int64, error) {
 //
 // Returns (true, nil) when the CAR passes every check.
 func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID string, expectedRootCID string) (bool, error) {
-	// ── 1. Get remote file size ─────────────────────────────────────────
-	fileSize, err := getRemoteFileSize(ctx, gateway, txID)
+	// ── 1. Download the first 200 bytes + get total size ────────────
+	headerBytes, resp, err := gateway.DownloadRangeWithResponse(ctx, txID, 0, 199)
 	if err != nil {
-		return false, fmt.Errorf("failed to get remote file size: %w", err)
+		return false, fmt.Errorf("failed to download CAR header: %w", err)
 	}
 
-	// ── 2. Create SDK parser backed by remote reader ────────────────────
+	fileSize, err := parseContentRangeTotal(resp.Header.Get("Content-Range"))
+	if err != nil {
+		return false, fmt.Errorf("failed to get file size from Content-Range: %w", err)
+	}
+
+	// ── 2. Parse v2 header (validation + cross-check for legacy) ────
+	derivedSize, err := parseV2Header(headerBytes)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse CAR v2 header: %w", err)
+	}
+
+	// For legacy format the header contains IndexSize; cross-check it
+	// against the Content-Range total to detect truncated files.
+	if derivedSize > 0 && derivedSize != fileSize {
+		return false, fmt.Errorf("CAR size mismatch: header says %d, Content-Range says %d",
+			derivedSize, fileSize)
+	}
+
+	// ── 3. Create SDK parser backed by remote reader ────────────────
 	reader := newRemoteCarReader(ctx, gateway, txID, fileSize)
 	parser, err := sdkcar.NewCarParserFromReader(reader, fileSize)
 	if err != nil {
@@ -224,23 +221,23 @@ func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID s
 	}
 	defer parser.Close()
 
-	// ── 3. Parse CAR metadata (headers only) ────────────────────────────
+	// ── 4. Parse CAR metadata (headers only) ────────────────────────
 	info, err := parser.ParseInfo()
 	if err != nil {
 		return false, fmt.Errorf("failed to parse CAR info: %w", err)
 	}
 
-	// ── 4. Check version ────────────────────────────────────────────────
+	// ── 5. Check version ────────────────────────────────────────────
 	if info.Version != 2 {
 		return false, fmt.Errorf("expected CAR v2, got v%d", info.Version)
 	}
 
-	// ── 5. Check index presence ─────────────────────────────────────────
+	// ── 6. Check index presence ─────────────────────────────────────
 	if !info.HasIndex {
 		return false, fmt.Errorf("CAR file has no index")
 	}
 
-	// ── 6. Root CID match ───────────────────────────────────────────────
+	// ── 7. Root CID match ───────────────────────────────────────────
 	expectedCID, err := cid.Decode(expectedRootCID)
 	if err != nil {
 		return false, fmt.Errorf("invalid expected root CID %q: %w", expectedRootCID, err)
@@ -258,7 +255,7 @@ func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID s
 			expectedRootCID, info.Roots)
 	}
 
-	// ── 7. Validate index integrity ─────────────────────────────────────
+	// ── 8. Validate index integrity ─────────────────────────────────
 	if err := parser.ValidateIndex(); err != nil {
 		return false, fmt.Errorf("index validation failed: %w", err)
 	}

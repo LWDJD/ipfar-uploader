@@ -911,10 +911,18 @@ func (gc *GatewayClient) QueryExistingCARs(ctx context.Context, rootCID string, 
 // DownloadTransactionDataRange downloads a byte range of a transaction's data.
 // start and end are inclusive. Use -1 for end to download to EOF.
 func (gc *GatewayClient) DownloadTransactionDataRange(ctx context.Context, txID string, start, end int64) ([]byte, error) {
+	data, _, err := gc.DownloadRangeWithResponse(ctx, txID, start, end)
+	return data, err
+}
+
+// DownloadRangeWithResponse downloads a byte range of a transaction's data
+// and also returns the raw HTTP response so the caller can inspect headers
+// (e.g. Content-Range).  The caller must not close resp.Body.
+func (gc *GatewayClient) DownloadRangeWithResponse(ctx context.Context, txID string, start, end int64) ([]byte, *http.Response, error) {
 	url := gc.GatewayURL + "/" + txID
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	if end < 0 {
@@ -925,15 +933,21 @@ func (gc *GatewayClient) DownloadTransactionDataRange(ctx context.Context, txID 
 
 	resp, err := gc.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to download data: %w", err)
+		return nil, nil, fmt.Errorf("failed to download data: %w", err)
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return nil, fmt.Errorf("gateway returned %d", resp.StatusCode)
+		resp.Body.Close()
+		return nil, nil, fmt.Errorf("gateway returned %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return data, resp, nil
 }
 
 // DownloadTransactionData downloads the full transaction data.
