@@ -214,13 +214,9 @@ func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID s
 		}
 	}
 
-	// ── Trust fallback: every gateway returned 404 ──────────────────
+	// ── All gateways returned 404 — cannot verify, trigger fresh upload ──
 	if allNotFound {
-		status, statusErr := gateway.GetTransactionStatus(ctx, txID)
-		if statusErr == nil && status.Confirmed && status.BlockHeight > 0 {
-			fmt.Printf("Warning: unable to verify CAR via public gateways, trusting on-chain confirmation at height %d\n", status.BlockHeight)
-			return true, nil
-		}
+		return false, fmt.Errorf("unable to verify CAR %s via any public gateway", txID)
 	}
 
 	if lastErr != nil {
