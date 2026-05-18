@@ -253,6 +253,14 @@ func (tb *TransactionBuilder) Build() *Transaction {
 // Sign signs the transaction using RSA-PSS SHA-256.
 func (tx *Transaction) Sign(privKey *rsa.PrivateKey) error {
 	sigData := tx.deepHash()
+	// Debug: print first 16 bytes of deepHash
+	if DebugEnabled {
+		preview := sigData
+		if len(preview) > 16 {
+			preview = preview[:16]
+		}
+		debugLog("Transaction.Sign: deepHash[:16]=%x, len=%d", preview, len(sigData))
+	}
 	hashed := sha256.Sum256(sigData)
 	sig, err := rsa.SignPSS(rand.Reader, privKey, crypto.SHA256, hashed[:], &rsa.PSSOptions{
 		SaltLength: rsa.PSSSaltLengthAuto,
@@ -263,6 +271,7 @@ func (tx *Transaction) Sign(privKey *rsa.PrivateKey) error {
 	}
 	tx.Signature = base64.RawURLEncoding.EncodeToString(sig)
 	tx.ID = base64.RawURLEncoding.EncodeToString(sha256Hash(sig))
+	debugLog("Transaction.Sign: sigLen=%d, txID=%s", len(sig), tx.ID)
 	return nil
 }
 
@@ -393,13 +402,16 @@ func (gc *GatewayClient) SubmitTransaction(ctx context.Context, tx *Transaction)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	start := debugHTTPStart(req.Method, req.URL.String())
 	resp, err := gc.client.Do(req)
 	if err != nil {
+		debugHTTPDone(start, 0, nil, err)
 		return "", fmt.Errorf("failed to submit tx: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+	debugHTTPDone(start, resp.StatusCode, respBody, nil)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		return "", fmt.Errorf("gateway returned %d: %s", resp.StatusCode, string(respBody))
@@ -422,8 +434,10 @@ func (gc *GatewayClient) GetTransactionStatus(ctx context.Context, txID string) 
 		return nil, err
 	}
 
+	start := debugHTTPStart(req.Method, req.URL.String())
 	resp, err := gc.client.Do(req)
 	if err != nil {
+		debugHTTPDone(start, 0, nil, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -459,8 +473,10 @@ func (gc *GatewayClient) GetTransactionDataSize(ctx context.Context, txID string
 		return 0, err
 	}
 
+	start := debugHTTPStart(req.Method, req.URL.String())
 	resp, err := gc.client.Do(req)
 	if err != nil {
+		debugHTTPDone(start, 0, nil, err)
 		return 0, err
 	}
 	defer resp.Body.Close()
@@ -527,12 +543,15 @@ func (gc *GatewayClient) GetReward(ctx context.Context, dataSize int64) (string,
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
+	start := debugHTTPStart(req.Method, req.URL.String())
 	resp, err := gc.client.Do(req)
 	if err != nil {
+		debugHTTPDone(start, 0, nil, err)
 		return "", fmt.Errorf("failed to get price: %w", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
+	debugHTTPDone(start, resp.StatusCode, body, nil)
 	if err != nil {
 		return "", err
 	}
@@ -545,12 +564,15 @@ func (gc *GatewayClient) GetAnchor(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
+	start := debugHTTPStart(req.Method, req.URL.String())
 	resp, err := gc.client.Do(req)
 	if err != nil {
+		debugHTTPDone(start, 0, nil, err)
 		return "", fmt.Errorf("failed to get anchor: %w", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
+	debugHTTPDone(start, resp.StatusCode, body, nil)
 	if err != nil {
 		return "", err
 	}
@@ -579,13 +601,16 @@ func (gc *GatewayClient) UploadDataRaw(ctx context.Context, data []byte) (string
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 
+	start := debugHTTPStart(req.Method, req.URL.String())
 	resp, err := gc.client.Do(req)
 	if err != nil {
+		debugHTTPDone(start, 0, nil, err)
 		return "", fmt.Errorf("failed to submit raw data: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+	debugHTTPDone(start, resp.StatusCode, respBody, nil)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		return "", fmt.Errorf("gateway returned %d: %s", resp.StatusCode, string(respBody))
 	}
@@ -862,13 +887,16 @@ func (gc *GatewayClient) QueryExistingCARs(ctx context.Context, rootCID string, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	start := debugHTTPStart(req.Method, req.URL.String())
 	resp, err := gc.client.Do(req)
 	if err != nil {
+		debugHTTPDone(start, 0, nil, err)
 		return nil, fmt.Errorf("GraphQL query failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+	debugHTTPDone(start, resp.StatusCode, respBody, nil)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GraphQL returned %d: %s", resp.StatusCode, string(respBody))
 	}
@@ -920,22 +948,27 @@ func (gc *GatewayClient) DownloadRangeWithResponse(ctx context.Context, txID str
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 	}
 
+	dbgStart := debugHTTPStart(req.Method, req.URL.String())
 	resp, err := gc.client.Do(req)
 	if err != nil {
+		debugHTTPDone(dbgStart, 0, nil, err)
 		return nil, nil, fmt.Errorf("failed to download data: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		resp.Body.Close()
+		debugHTTPDone(dbgStart, resp.StatusCode, nil, fmt.Errorf("gateway returned %d", resp.StatusCode))
 		return nil, nil, fmt.Errorf("gateway returned %d", resp.StatusCode)
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
+		debugHTTPDone(dbgStart, resp.StatusCode, nil, err)
 		return nil, nil, err
 	}
 
+	debugHTTPDone(dbgStart, resp.StatusCode, data, nil)
 	return data, resp, nil
 }
 

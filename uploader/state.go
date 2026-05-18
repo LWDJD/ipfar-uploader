@@ -91,9 +91,11 @@ func stateFilePath(filePath string) string {
 // Returns (nil, nil) if the state file does not exist.
 func LoadState(filePath string) (*UploadState, error) {
 	sp := stateFilePath(filePath)
+	debugLog("LoadState: reading %s", sp)
 	data, err := os.ReadFile(sp)
 	if err != nil {
 		if os.IsNotExist(err) {
+			debugLog("LoadState: file not found, returning nil")
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to read state file %s: %w", sp, err)
@@ -103,12 +105,16 @@ func LoadState(filePath string) (*UploadState, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("failed to parse state file %s: %w", sp, err)
 	}
+	debugLog("LoadState: status=%s, carTXID=%s, carConfirmed=%v, metaTXID=%s, metaConfirmed=%v",
+		s.Status, s.CarTXID, s.CarConfirmed, s.MetaTXID, s.MetaConfirmed)
 	return &s, nil
 }
 
 // Save atomically writes the upload state to disk (temp file + rename).
 func (s *UploadState) Save() error {
 	sp := stateFilePath(s.FilePath)
+	debugLog("Save: writing %s, status=%s, carTXID=%s, carConfirmed=%v, retryCount=%d",
+		sp, s.Status, s.CarTXID, s.CarConfirmed, s.RetryCount)
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal state: %w", err)

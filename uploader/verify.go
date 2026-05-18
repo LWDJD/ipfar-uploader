@@ -203,11 +203,14 @@ func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID s
 	allNotFound := true
 
 	for _, gwURL := range gwURLs {
+		debugLog("VerifyRemoteCAR: trying gateway %s", gwURL)
 		gw := arweave.NewGatewayClient(gwURL)
 		verified, err := verifyRemoteCARWithGateway(ctx, gw, txID, expectedRootCID)
 		if err == nil && verified {
+			debugLog("VerifyRemoteCAR: success via %s", gwURL)
 			return true, nil
 		}
+		debugLog("VerifyRemoteCAR: gateway %s failed: %v", gwURL, err)
 		lastErr = err
 		if !isNotFoundError(err) {
 			allNotFound = false

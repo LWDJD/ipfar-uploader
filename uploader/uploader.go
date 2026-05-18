@@ -21,8 +21,9 @@ type Config struct {
 	Wallet     *arweave.Wallet
 	Gateway    *arweave.GatewayClient
 	UseBundle  bool
-	BundleSize int // max items per bundle (0 = all in one)
-	PoWWorkers int // number of parallel PoW workers (0 = use pow.DefaultWorkers())
+	BundleSize int  // max items per bundle (0 = all in one)
+	PoWWorkers int  // number of parallel PoW workers (0 = use pow.DefaultWorkers())
+	Debug      bool // enable verbose debug logging to stderr
 }
 
 // NewDefaultConfig creates a config with default Arweave.net gateway.
@@ -68,6 +69,8 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 		FilePath: filePath,
 	}
 
+	debugLog("UploadFile: path=%s", filePath)
+
 	// ── Pre-flight: compute file hash, create CAR ─────────────────────
 	fileHash, err := ComputeFileHash(filePath)
 	if err != nil {
@@ -85,6 +88,8 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 	result.OriginalName = filepath.Base(filePath)
 	result.ContentType = detectContentType(filePath)
 
+	debugLog("UploadFile: dataSize=%d, rootCID will be computed", result.DataSize)
+
 	carBytes, rootCID, err := car.CreateCarV2FromBytes(fileData)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to create CAR v2: %w", err)
@@ -98,6 +103,8 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 		method = metadata.MethodBundle
 	}
 	result.Method = method
+
+	debugLog("UploadFile: method=%s, rootCID=%s", method, result.RootCID)
 
 	// ── Load or create state ──────────────────────────────────────────
 	state, err := LoadState(filePath)
@@ -217,8 +224,10 @@ func (u *Uploader) uploadCarRaw(ctx context.Context, result *UploadResult, carBy
 
 	// ── Route: chunked or direct ──────────────────────────────────────
 	if len(carBytes) >= arweave.ChunkSize {
+		debugLog("uploadCarRaw: routing to chunked path, carSize=%d", len(carBytes))
 		return u.uploadCarRawChunked(ctx, result, carBytes, state, cachePath, arTags)
 	}
+	debugLog("uploadCarRaw: routing to direct path, carSize=%d", len(carBytes))
 	return u.uploadCarRawDirect(ctx, result, carBytes, state, cachePath, arTags)
 }
 
@@ -227,6 +236,7 @@ func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult,
 	// Upload via chunked path (goar) — uses SHA-384 deep hash and
 	// base64url-encoded tags required by Arweave mainnet gateways.
 	fmt.Printf("   Uploading CAR file (%d bytes)...\n", len(carBytes))
+	debugLog("uploadCarRawDirect: carSize=%d", len(carBytes))
 
 	tx, status, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, carBytes, arTags)
 	if err != nil {
@@ -261,6 +271,7 @@ func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult,
 // uploadCarRawChunked uploads the CAR via the chunked /chunk endpoint.
 func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult, carBytes []byte, state *UploadState, cachePath string, arTags []arweave.Tag) error {
 	fmt.Printf("   Uploading CAR file via chunked upload (%d bytes)...\n", len(carBytes))
+	debugLog("uploadCarRawChunked: carSize=%d", len(carBytes))
 
 	tx, status, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, carBytes, arTags)
 	if err != nil {
@@ -294,6 +305,7 @@ func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult
 
 // uploadCarBundle uploads CAR+meta as a single bundle tx with state tracking.
 func (u *Uploader) uploadCarBundle(ctx context.Context, result *UploadResult, carBytes []byte, state *UploadState, cachePath string, arTags []arweave.Tag) error {
+	debugLog("uploadCarBundle: starting, rootCID=%s, dataSize=%d", result.RootCID, result.DataSize)
 	if state.CarConfirmed {
 		result.DataTXID = state.CarTXID
 		result.DataHeight = state.CarHeight
@@ -479,6 +491,7 @@ func (u *Uploader) uploadMetaWithState(ctx context.Context, result *UploadResult
 	// Upload via chunked path (goar) — uses SHA-384 deep hash and
 	// base64url-encoded tags required by Arweave mainnet gateways.
 	fmt.Printf("   Uploading metadata...\n")
+	debugLog("uploadMetaWithState: metaJSON preview=%.100s", string(metaJSON))
 	metaTX, metaStatus, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, []byte(metaBase64), toArweaveTags(metaTags))
 	if err != nil {
 		state.SetError(fmt.Errorf("metadata upload failed: %w", err))
@@ -606,10 +619,13 @@ func (u *Uploader) computePoWSinglePass(ctx context.Context, result *UploadResul
 	if cachedSalt, ok := pow.LoadPoWCache(cachePath, result.RootCID, result.DataTXID); ok {
 		result.PoW = cachedSalt
 		fmt.Printf("   PoW loaded from cache (%s) — salt=%s\n", cachePath, cachedSalt)
+		debugLog("computePoWSinglePass: cache hit, salt=%s", cachedSalt)
 		return nil
 	}
 
+	debugLog("computePoWSinglePass: cache miss, computing...")
 	fmt.Printf("   Computing PoW (%d workers)", powWorkers)
+	debugLog("computePoWSinglePass: workers=%d", powWorkers)
 	var lastPrint time.Time
 	var totalAttempts uint64
 	progress := func(info pow.ProgressInfo) {
@@ -963,6 +979,7 @@ func (u *Uploader) dedupCheckCAR(ctx context.Context, result *UploadResult, stat
 
 	for _, txID := range candidates {
 		fmt.Printf("   Found candidate CAR on chain: %s\n", txID)
+		debugLog("dedupCheckCAR: verifying candidate %s", txID)
 		verified, verifyErr := VerifyRemoteCAR(ctx, u.cfg.Gateway, txID, result.RootCID)
 		if verifyErr == nil && verified {
 			fmt.Printf("   CAR verified, reusing existing transaction\n")

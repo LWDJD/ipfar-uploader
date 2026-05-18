@@ -20,6 +20,7 @@ var (
 	method     string
 	bundleSize int
 	powWorkers int
+	debug      bool
 )
 
 // Run parses command-line arguments and executes the appropriate command.
@@ -61,6 +62,7 @@ func runFile(ctx context.Context, args []string) error {
 	fs.StringVar(&method, "method", "", "Upload method: raw, bundle, cross-bundle (overrides --bundle)")
 	fs.IntVar(&bundleSize, "bundle-size", 0, "Max items per bundle (0 = all in one)")
 	fs.IntVar(&powWorkers, "pow-workers", 0, "Number of parallel PoW workers (0 = auto)")
+	fs.BoolVar(&debug, "debug", false, "Enable verbose debug logging to stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -82,6 +84,7 @@ func runDir(ctx context.Context, args []string) error {
 	fs.StringVar(&method, "method", "", "Upload method: raw, bundle, cross-bundle (overrides --bundle)")
 	fs.IntVar(&bundleSize, "bundle-size", 0, "Max items per bundle (0 = all in one)")
 	fs.IntVar(&powWorkers, "pow-workers", 0, "Number of parallel PoW workers (0 = auto)")
+	fs.BoolVar(&debug, "debug", false, "Enable verbose debug logging to stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -116,6 +119,9 @@ func runWallet(args []string) error {
 }
 
 func uploadFile(ctx context.Context, filePath string) error {
+	uploader.DebugEnabled = debug
+	arweave.DebugEnabled = debug
+
 	cfg, err := buildConfig()
 	if err != nil {
 		return err
@@ -143,6 +149,9 @@ func uploadFile(ctx context.Context, filePath string) error {
 }
 
 func uploadDir(ctx context.Context, dirPath string) error {
+	uploader.DebugEnabled = debug
+	arweave.DebugEnabled = debug
+
 	cfg, err := buildConfig()
 	if err != nil {
 		return err
@@ -203,6 +212,7 @@ func buildConfig() (*uploader.Config, error) {
 	}
 	cfg.BundleSize = bundleSize
 	cfg.PoWWorkers = powWorkers
+	cfg.Debug = debug
 
 	return cfg, nil
 }

@@ -60,17 +60,21 @@ func (gc *GatewayClient) submitChunkGoar(ctx context.Context, gcGoar *goartypes.
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	start := debugHTTPStart(req.Method, req.URL.String())
 	resp, err := gc.client.Do(req)
 	if err != nil {
+		debugHTTPDone(start, 0, nil, err)
 		return fmt.Errorf("failed to upload chunk at offset %s: %w", gcGoar.Offset, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
+		debugHTTPDone(start, resp.StatusCode, respBody, nil)
 		return fmt.Errorf("gateway returned %d for chunk at offset %s: %s",
 			resp.StatusCode, gcGoar.Offset, string(respBody))
 	}
+	debugHTTPDone(start, resp.StatusCode, nil, nil)
 
 	return nil
 }
@@ -83,7 +87,11 @@ func (gc *GatewayClient) submitChunkGoar(ctx context.Context, gcGoar *goartypes.
 // (SHA-384, matching the Arweave spec). This is critical because our previous
 // deepHash used SHA-256 which produced wrong transaction IDs on real gateways.
 func signTxGoar(tx *goartypes.Transaction, wallet *Wallet) error {
-	return goarutils.SignTransaction(tx, wallet.PrivateKey)
+	err := goarutils.SignTransaction(tx, wallet.PrivateKey)
+	if err == nil {
+		debugLog("signTxGoar: txID=%s, dataRoot=%s", tx.ID, tx.DataRoot)
+	}
+	return err
 }
 
 // submitChunkedTransactionGoar posts a transaction without data to /tx.
@@ -99,13 +107,16 @@ func (gc *GatewayClient) submitChunkedTransactionGoar(ctx context.Context, tx *g
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	start := debugHTTPStart(req.Method, req.URL.String())
 	resp, err := gc.client.Do(req)
 	if err != nil {
+		debugHTTPDone(start, 0, nil, err)
 		return "", fmt.Errorf("failed to submit chunked tx: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+	debugHTTPDone(start, resp.StatusCode, respBody, nil)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		return "", fmt.Errorf("gateway returned %d: %s", resp.StatusCode, string(respBody))
@@ -207,8 +218,10 @@ func (gc *GatewayClient) verifyAllChunks(ctx context.Context, txID string, tx *g
 		}
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(fetchLen)-1))
 
+		vStart := debugHTTPStart(req.Method, req.URL.String())
 		resp, err := gc.client.Do(req)
 		if err != nil {
+			debugHTTPDone(vStart, 0, nil, err)
 			return fmt.Errorf("verify chunk %d/%d: failed to download: %w", i, nChunks, err)
 		}
 
@@ -267,6 +280,11 @@ func buildGoarTransaction(owner string, dataSize int64, tags []Tag, reward strin
 		}
 	}
 
+	ownerPrefix := owner
+	if len(ownerPrefix) > 20 {
+		ownerPrefix = ownerPrefix[:20] + "..."
+	}
+	debugLog("buildGoarTransaction: owner=%s, dataSize=%d, tags=%d", ownerPrefix, dataSize, len(goarTags))
 	return &goartypes.Transaction{
 		Format:   2,
 		Owner:    owner,
@@ -305,6 +323,7 @@ func (gc *GatewayClient) uploadDataChunkedInternal(
 	dataSize int64,
 	tags []Tag,
 ) (*Transaction, *TransactionStatus, error) {
+	debugLog("uploadDataChunkedInternal: dataSize=%d, hasStream=%v", dataSize, dataReader != nil)
 	var dataInterface interface{}
 	if dataReader != nil {
 		dataInterface = dataReader
@@ -336,6 +355,11 @@ func (gc *GatewayClient) uploadDataChunkedInternal(
 	if err := goarutils.PrepareChunks(tx, dataInterface, int(dataSize)); err != nil {
 		return nil, nil, fmt.Errorf("failed to prepare chunks: %w", err)
 	}
+	nChunks := 0
+	if tx.Chunks != nil {
+		nChunks = len(tx.Chunks.Chunks)
+	}
+	debugLog("PrepareChunks: chunks=%d, dataRoot=%s", nChunks, tx.DataRoot)
 
 	// Sign with correct deep hash (SHA-384)
 	if err := signTxGoar(tx, wallet); err != nil {
