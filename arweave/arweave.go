@@ -871,7 +871,7 @@ func (gc *GatewayClient) QueryExistingCAR(ctx context.Context, rootCID string) (
 // tags and goar chunked-upload base64url-encoded tags.
 func (gc *GatewayClient) QueryExistingCARs(ctx context.Context, rootCID string, limit int) ([]string, error) {
 	if limit <= 0 {
-		limit = 5
+		limit = 8
 	}
 
 	// Base64url-encoded forms of the tag values (for chunked-upload

@@ -1075,7 +1075,7 @@ func (u *Uploader) queryExistingCARsWithRetry(ctx context.Context, rootCID strin
 	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
 	for i := 0; i < maxRetries; i++ {
-		ids, err := u.cfg.Gateway.QueryExistingCARs(ctx, rootCID, 5)
+		ids, err := u.cfg.Gateway.QueryExistingCARs(ctx, rootCID, 8)
 		if err == nil {
 			return ids
 		}

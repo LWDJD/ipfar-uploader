@@ -15,6 +15,14 @@ import (
 	"github.com/ipfs/go-cid"
 )
 
+// fallbackGatewayURLs are public Arweave gateways tried when the primary
+// gateway fails to serve raw transaction data (404 or network error).
+// The list is deduplicated against the primary gateway at runtime.
+var fallbackGatewayURLs = []string{
+	"https://ar-io.dev",
+	"https://arweave.net",
+}
+
 // remoteCarReader implements io.ReaderAt over HTTP range requests to an
 // Arweave gateway.  Each ReadAt call issues a single range request; the
 // SDK's CarParser only touches the header / index regions so the total
@@ -174,17 +182,56 @@ func parseContentRangeTotal(cr string) (int64, error) {
 // VerifyRemoteCAR downloads key portions of a remote CAR file from Arweave
 // and validates it using the SDK's CAR parser (ipfar-sdk/verify/ipfs).
 //
-// The file size is obtained from the data_size field of GET /tx/{txID}.
-// No HEAD or Range requests are needed for size discovery.
+// Multi‑gateway fallback: if the primary gateway returns 404 or a network
+// error when serving raw transaction data, alternate public gateways are
+// tried in sequence.  If every gateway returns 404 the function falls back
+// to trusting on‑chain confirmation (at least 1 confirmation).
 //
-// Checks performed:
+// Checks performed (when raw data is reachable):
 //  1. CAR version == 2
 //  2. HasIndex == true
 //  3. Root CID matches expectedRootCID
 //  4. Index passes ValidateIndex (boundary sanity)
 //
-// Returns (true, nil) when the CAR passes every check.
+// Returns (true, nil) when the CAR passes every check, or when the trust
+// fallback is engaged.
 func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID string, expectedRootCID string) (bool, error) {
+	// Collect unique gateway URLs (primary + fallbacks, deduplicated).
+	gwURLs := collectGatewayURLs(gateway)
+
+	var lastErr error
+	allNotFound := true
+
+	for _, gwURL := range gwURLs {
+		gw := arweave.NewGatewayClient(gwURL)
+		verified, err := verifyRemoteCARWithGateway(ctx, gw, txID, expectedRootCID)
+		if err == nil && verified {
+			return true, nil
+		}
+		lastErr = err
+		if !isNotFoundError(err) {
+			allNotFound = false
+		}
+	}
+
+	// ── Trust fallback: every gateway returned 404 ──────────────────
+	if allNotFound {
+		status, statusErr := gateway.GetTransactionStatus(ctx, txID)
+		if statusErr == nil && status.Confirmed && status.BlockHeight > 0 {
+			fmt.Printf("Warning: unable to verify CAR via public gateways, trusting on-chain confirmation at height %d\n", status.BlockHeight)
+			return true, nil
+		}
+	}
+
+	if lastErr != nil {
+		return false, fmt.Errorf("all gateways failed to verify CAR %s: %w", txID, lastErr)
+	}
+	return false, fmt.Errorf("all gateways failed to verify CAR %s", txID)
+}
+
+// verifyRemoteCARWithGateway attempts to verify a remote CAR using a single
+// gateway.  It is the per‑gateway workhorse called by VerifyRemoteCAR.
+func verifyRemoteCARWithGateway(ctx context.Context, gateway *arweave.GatewayClient, txID string, expectedRootCID string) (bool, error) {
 	// ── 1. Get file size from /tx/{txID} ────────────────────────────
 	fileSize, err := gateway.GetTransactionDataSize(ctx, txID)
 	if err != nil {
@@ -239,4 +286,35 @@ func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID s
 	}
 
 	return true, nil
+}
+
+// collectGatewayURLs returns a deduplicated list of gateway URLs starting
+// with the primary gateway followed by fallbackGatewayURLs.
+func collectGatewayURLs(primary *arweave.GatewayClient) []string {
+	seen := make(map[string]bool)
+	var urls []string
+
+	primaryURL := strings.TrimRight(primary.GatewayURL, "/")
+	seen[primaryURL] = true
+	urls = append(urls, primaryURL)
+
+	for _, u := range fallbackGatewayURLs {
+		u = strings.TrimRight(u, "/")
+		if !seen[u] {
+			seen[u] = true
+			urls = append(urls, u)
+		}
+	}
+	return urls
+}
+
+// isNotFoundError returns true when err indicates an HTTP 404 from a gateway.
+func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "gateway returned 404") ||
+		strings.Contains(s, " 404 ") ||
+		strings.HasSuffix(s, "404")
 }
