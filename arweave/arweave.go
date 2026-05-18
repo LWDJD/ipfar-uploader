@@ -469,16 +469,22 @@ func (gc *GatewayClient) GetTransactionDataSize(ctx context.Context, txID string
 		return 0, fmt.Errorf("gateway returned %d", resp.StatusCode)
 	}
 
+	// data_size is returned as a string by the gateway (e.g. "1048746"),
+	// so we decode it as a string and then parse it into an int64.
 	var result struct {
-		DataSize int64 `json:"data_size"`
+		DataSize string `json:"data_size"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return 0, err
 	}
-	if result.DataSize <= 0 {
-		return 0, fmt.Errorf("invalid data_size: %d", result.DataSize)
+	dataSize, err := strconv.ParseInt(result.DataSize, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse data_size %q: %w", result.DataSize, err)
 	}
-	return result.DataSize, nil
+	if dataSize <= 0 {
+		return 0, fmt.Errorf("invalid data_size: %d", dataSize)
+	}
+	return dataSize, nil
 }
 
 // WaitForConfirmation polls until the transaction is confirmed.
