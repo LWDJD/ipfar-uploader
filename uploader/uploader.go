@@ -11,9 +11,10 @@ import (
 	"time"
 
 	"github.com/LWDJD/ipfar-uploader/arweave"
-	"github.com/LWDJD/ipfar-uploader/car"
 	"github.com/LWDJD/ipfar-uploader/metadata"
-	"github.com/LWDJD/ipfar-uploader/pow"
+
+	"github.com/LWDJD/ipfar-sdk/ipfar"
+	sdkpow "github.com/LWDJD/ipfar-sdk/pow"
 )
 
 // Config holds uploader configuration.
@@ -22,7 +23,7 @@ type Config struct {
 	Gateway    *arweave.GatewayClient
 	UseBundle  bool
 	BundleSize int  // max items per bundle (0 = all in one)
-	PoWWorkers int  // number of parallel PoW workers (0 = use pow.DefaultWorkers())
+	PoWWorkers int  // number of parallel PoW workers (0 = use sdkpow.DefaultWorkers())
 	Debug      bool // enable verbose debug logging to stderr
 }
 
@@ -90,7 +91,7 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 
 	debugLog("UploadFile: dataSize=%d, rootCID will be computed", result.DataSize)
 
-	carBytes, rootCID, err := car.CreateCarV2FromBytes(fileData)
+	carBytes, rootCID, err := ipfar.BuildCarV2(fileData)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to create CAR v2: %w", err)
 		return result, result.Error
@@ -226,7 +227,7 @@ func (u *Uploader) uploadCarRaw(ctx context.Context, result *UploadResult, carBy
 	// uploadCarRawDirect / uploadCarRawChunked).  We cannot compute
 	// it here because the password = root_cid + data_txid and the
 	// real data_txid is not known until after submission.
-	if !pow.NeedsPoW(result.DataSize) {
+	if !sdkpow.NeedsPoW(result.DataSize) {
 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
 	}
 
@@ -270,7 +271,7 @@ func (u *Uploader) uploadCarRawDirect(ctx context.Context, result *UploadResult,
 	fmt.Printf("   CAR confirmed at height=%d\n", status.BlockHeight)
 
 	// Compute PoW now that we have the real data_txid
-	if pow.NeedsPoW(result.DataSize) {
+	if sdkpow.NeedsPoW(result.DataSize) {
 		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
 			return err
 		}
@@ -305,7 +306,7 @@ func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult
 	fmt.Printf("   CAR confirmed at height=%d\n", status.BlockHeight)
 
 	// Compute PoW now that we have the real data_txid
-	if pow.NeedsPoW(result.DataSize) {
+	if sdkpow.NeedsPoW(result.DataSize) {
 		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
 			return err
 		}
@@ -338,7 +339,7 @@ func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult
 // 	fmt.Printf("   CAR item signed: %s\n", carItemID)
 // 
 // 	// Compute PoW
-// 	if pow.NeedsPoW(result.DataSize) {
+// 	if sdkpow.NeedsPoW(result.DataSize) {
 // 		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
 // 			return err
 // 		}
@@ -361,9 +362,9 @@ func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult
 // 		ContentType:  result.ContentType,
 // 		OriginalName: result.OriginalName,
 // 	}
-// 	if pow.NeedsPoW(result.DataSize) {
+// 	if sdkpow.NeedsPoW(result.DataSize) {
 // 		meta.PoW = result.PoW
-// 		meta.PoWAlg = pow.Algorithm
+// 		meta.PoWAlg = sdkpow.Algorithm
 // 	}
 // 
 // 	metaJSON, err := meta.ToJSON()
@@ -484,9 +485,9 @@ func (u *Uploader) uploadMetaWithState(ctx context.Context, result *UploadResult
 		ContentType:  result.ContentType,
 		OriginalName: result.OriginalName,
 	}
-	if pow.NeedsPoW(result.DataSize) {
+	if sdkpow.NeedsPoW(result.DataSize) {
 		meta.PoW = result.PoW
-		meta.PoWAlg = pow.Algorithm
+		meta.PoWAlg = sdkpow.Algorithm
 	}
 
 	metaJSON, err := meta.ToJSON()
@@ -678,7 +679,7 @@ func parseSubmittedAt(s string) time.Time {
 func (u *Uploader) computePoWSinglePass(ctx context.Context, result *UploadResult, cachePath string) error {
 	powWorkers := effectivePoWWorkers(u.cfg.PoWWorkers)
 
-	if cachedSalt, ok := pow.LoadPoWCache(cachePath, result.RootCID, result.DataTXID); ok {
+	if cachedSalt, ok := sdkpow.LoadPoWCache(cachePath, result.RootCID, result.DataTXID); ok {
 		result.PoW = cachedSalt
 		fmt.Printf("   PoW loaded from cache (%s) — salt=%s\n", cachePath, cachedSalt)
 		debugLog("computePoWSinglePass: cache hit, salt=%s", cachedSalt)
@@ -690,27 +691,31 @@ func (u *Uploader) computePoWSinglePass(ctx context.Context, result *UploadResul
 	debugLog("computePoWSinglePass: workers=%d", powWorkers)
 	var lastPrint time.Time
 	var totalAttempts uint64
-	progress := func(info pow.ProgressInfo) {
+	var prevAttempts uint64
+	progress := func(info sdkpow.ProgressInfo) {
 		totalAttempts = info.Attempts
 		now := time.Now()
-		if info.Attempts == 0 || now.Sub(lastPrint) < time.Second {
+		elapsed := now.Sub(lastPrint).Seconds()
+		if info.Attempts == 0 || elapsed < 1.0 {
 			return
 		}
+		speed := float64(info.Attempts-prevAttempts) / elapsed
+		prevAttempts = info.Attempts
 		lastPrint = now
-		reportPoWProgress("Computing", powWorkers, info)
+		reportPoWProgress("Computing", powWorkers, info.Attempts, speed, info.Found, info.Salt)
 	}
 
 	start := time.Now()
-	powSalt, err := pow.ComputePoWParallelWithProgress(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers, progress)
+	powSalt, err := sdkpow.ComputePoW(ctx, result.RootCID, result.DataTXID, u.cfg.PoWWorkers, progress)
 	elapsed := time.Since(start)
 	if err != nil {
 		return fmt.Errorf("PoW computation failed: %w", err)
 	}
 	result.PoW = powSalt
 	fmt.Printf("\r   PoW completed: %s hashes in %.1fs — salt=%s                                         \n",
-		pow.FormatNumber(totalAttempts), elapsed.Seconds(), powSalt)
+		sdkpow.FormatNumber(totalAttempts), elapsed.Seconds(), powSalt)
 
-	if saveErr := pow.SavePoWCache(cachePath, result.RootCID, result.DataTXID, powSalt); saveErr != nil {
+	if saveErr := sdkpow.SavePoWCache(cachePath, result.RootCID, result.DataTXID, powSalt); saveErr != nil {
 		fmt.Fprintf(os.Stderr, "   Warning: failed to save PoW cache: %v\n", saveErr)
 	}
 	return nil
@@ -722,7 +727,7 @@ func (u *Uploader) computePoWSinglePass(ctx context.Context, result *UploadResul
 
 // uploadRaw handles the raw Arweave transaction flow (legacy, without state).
 func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes []byte, cachePath string, arTags []arweave.Tag) (*UploadResult, error) {
-	if !pow.NeedsPoW(result.DataSize) {
+	if !sdkpow.NeedsPoW(result.DataSize) {
 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
 	}
 
@@ -736,7 +741,7 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 	result.DataHeight = dataStatus.BlockHeight
 	fmt.Printf("   CAR uploaded: %s (height=%d)\n", result.DataTXID, result.DataHeight)
 
-	if pow.NeedsPoW(result.DataSize) {
+	if sdkpow.NeedsPoW(result.DataSize) {
 		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
 			result.Error = err
 			return result, result.Error
@@ -763,7 +768,7 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 // 	result.DataTXID = carItemID
 // 	fmt.Printf("   CAR item signed: %s\n", carItemID)
 // 
-// 	if pow.NeedsPoW(result.DataSize) {
+// 	if sdkpow.NeedsPoW(result.DataSize) {
 // 		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
 // 			result.Error = err
 // 			return result, result.Error
@@ -786,9 +791,9 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 // 		ContentType:  result.ContentType,
 // 		OriginalName: result.OriginalName,
 // 	}
-// 	if pow.NeedsPoW(result.DataSize) {
+// 	if sdkpow.NeedsPoW(result.DataSize) {
 // 		meta.PoW = result.PoW
-// 		meta.PoWAlg = pow.Algorithm
+// 		meta.PoWAlg = sdkpow.Algorithm
 // 	}
 // 
 // 	metaJSON, err := meta.ToJSON()
@@ -848,7 +853,7 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 // 	carItemID := base64.RawURLEncoding.EncodeToString(carItem.ID)
 // 	result.DataTXID = carItemID
 // 
-// 	if !pow.NeedsPoW(result.DataSize) {
+// 	if !sdkpow.NeedsPoW(result.DataSize) {
 // 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
 // 	}
 // 
@@ -873,7 +878,7 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 // 	result.DataHeight = status.BlockHeight
 // 	fmt.Printf("   Bundle confirmed at height=%d\n", result.DataHeight)
 // 
-// 	if pow.NeedsPoW(result.DataSize) {
+// 	if sdkpow.NeedsPoW(result.DataSize) {
 // 		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
 // 			result.Error = err
 // 			return result, result.Error
@@ -902,9 +907,9 @@ func (u *Uploader) uploadMetadata(ctx context.Context, result *UploadResult) err
 		ContentType:  result.ContentType,
 		OriginalName: result.OriginalName,
 	}
-	if pow.NeedsPoW(result.DataSize) {
+	if sdkpow.NeedsPoW(result.DataSize) {
 		meta.PoW = result.PoW
-		meta.PoWAlg = pow.Algorithm
+		meta.PoWAlg = sdkpow.Algorithm
 	}
 
 	metaJSON, err := meta.ToJSON()
@@ -929,12 +934,12 @@ func (u *Uploader) uploadMetadata(ctx context.Context, result *UploadResult) err
 // =============================================================================
 
 // reportPoWProgress prints a one-line PoW progress report.
-func reportPoWProgress(label string, workers int, info pow.ProgressInfo) {
+func reportPoWProgress(label string, workers int, attempts uint64, speed float64, found bool, salt string) {
 	const expectedTotal = 65536
-	pct := float64(info.Attempts) / float64(expectedTotal) * 100
+	pct := float64(attempts) / float64(expectedTotal) * 100
 	eta := ""
-	if info.Speed > 0 {
-		remaining := int((float64(expectedTotal) - float64(info.Attempts)) / info.Speed)
+	if speed > 0 {
+		remaining := int((float64(expectedTotal) - float64(attempts)) / speed)
 		if remaining > 0 {
 			if remaining >= 3600 {
 				eta = fmt.Sprintf("%dh%dm", remaining/3600, (remaining%3600)/60)
@@ -945,12 +950,16 @@ func reportPoWProgress(label string, workers int, info pow.ProgressInfo) {
 			}
 		}
 	}
+	saltInfo := ""
+	if found && salt != "" {
+		saltInfo = fmt.Sprintf(", salt=%s", salt)
+	}
 	if eta != "" {
-		fmt.Printf("\r   %s PoW (%d workers): %s hashes (%s) - %.1f%% ETA %s, best salt=%d     ",
-			label, workers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, eta, info.BestSalt)
+		fmt.Printf("\r   %s PoW (%d workers): %s hashes (%s) - %.1f%% ETA %s%s     ",
+			label, workers, sdkpow.FormatNumber(attempts), sdkpow.FormatSpeed(speed), pct, eta, saltInfo)
 	} else {
-		fmt.Printf("\r   %s PoW (%d workers): %s hashes (%s) - %.1f%%, best salt=%d     ",
-			label, workers, pow.FormatNumber(info.Attempts), pow.FormatSpeed(info.Speed), pct, info.BestSalt)
+		fmt.Printf("\r   %s PoW (%d workers): %s hashes (%s) - %.1f%%%s     ",
+			label, workers, sdkpow.FormatNumber(attempts), sdkpow.FormatSpeed(speed), pct, saltInfo)
 	}
 }
 
@@ -1031,7 +1040,7 @@ func effectivePoWWorkers(cfgWorkers int) int {
 	if cfgWorkers > 0 {
 		return cfgWorkers
 	}
-	return pow.DefaultWorkers()
+	return sdkpow.DefaultWorkers()
 }
 
 // dedupCheckCAR queries GraphQL for existing CAR transactions matching

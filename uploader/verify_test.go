@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"github.com/LWDJD/ipfar-uploader/arweave"
-	"github.com/LWDJD/ipfar-uploader/car"
+	"github.com/LWDJD/ipfar-sdk/ipfar"
 	"github.com/ipfs/go-cid"
 )
 
@@ -94,7 +94,7 @@ func newMockGateway(t *testing.T, carBytes []byte) (*arweave.GatewayClient, stri
 // uses the legacy "car\x02" pragma and varint-format v1 header).
 func TestVerifyRemoteCAR_LegacyFormat(t *testing.T) {
 	// Build a CAR v2 file locally
-	carBytes, rootCID, err := car.CreateCarV2FromBytes([]byte("hello world test data"))
+	carBytes, rootCID, err := ipfar.BuildCarV2([]byte("hello world test data"))
 	if err != nil {
 		t.Fatalf("failed to create CAR v2: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestVerifyRemoteCAR_LegacyFormat(t *testing.T) {
 
 // TestVerifyRemoteCAR_WrongRootCID tests that a wrong root CID triggers an error.
 func TestVerifyRemoteCAR_WrongRootCID(t *testing.T) {
-	carBytes, _, err := car.CreateCarV2FromBytes([]byte("some data"))
+	carBytes, _, err := ipfar.BuildCarV2([]byte("some data"))
 	if err != nil {
 		t.Fatalf("failed to create CAR v2: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestVerifyRemoteCAR_WrongRootCID(t *testing.T) {
 
 // TestVerifyRemoteCAR_InvalidCID tests that an invalid CID string is caught.
 func TestVerifyRemoteCAR_InvalidCID(t *testing.T) {
-	carBytes, _, err := car.CreateCarV2FromBytes([]byte("data"))
+	carBytes, _, err := ipfar.BuildCarV2([]byte("data"))
 	if err != nil {
 		t.Fatalf("failed to create CAR v2: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestVerifyRemoteCAR_CBORFormat(t *testing.T) {
 // TestVerifyRemoteCAR_MultipleRequests tests that the remote reader handles
 // multiple sequential small ReadAt calls correctly (byte-by-byte varint reads).
 func TestVerifyRemoteCAR_MultipleRequests(t *testing.T) {
-	carBytes, rootCID, err := car.CreateCarV2FromBytes([]byte("multi-request test payload"))
+	carBytes, rootCID, err := ipfar.BuildCarV2([]byte("multi-request test payload"))
 	if err != nil {
 		t.Fatalf("failed to create CAR v2: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestVerifyRemoteCAR_MultipleRequests(t *testing.T) {
 // =============================================================================
 
 func TestParseV2Header_Legacy(t *testing.T) {
-	carBytes, _, err := car.CreateCarV2FromBytes([]byte("test data for header parsing"))
+	carBytes, _, err := ipfar.BuildCarV2([]byte("test data for header parsing"))
 	if err != nil {
 		t.Fatalf("failed to create CAR v2: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestParseContentRangeTotal_Malformed(t *testing.T) {
 // a data_size that is too small (truncated), the SDK parser fails because
 // it cannot read the index at the end of the file.
 func TestVerifyRemoteCAR_TruncatedDataSize(t *testing.T) {
-	carBytes, rootCID, err := car.CreateCarV2FromBytes([]byte("truncated data_size test"))
+	carBytes, rootCID, err := ipfar.BuildCarV2([]byte("truncated data_size test"))
 	if err != nil {
 		t.Fatalf("failed to create CAR v2: %v", err)
 	}
@@ -380,10 +380,10 @@ func buildCBORFormatCAR(t *testing.T) ([]byte, cid.Cid) {
 	// Use the uploader's builder to get a valid root CID and data block,
 	// then re-encode using CBOR format.
 
-	builder := car.NewCarV2Builder()
-	rootCID, err := builder.AddRawBlock([]byte("hello cbor car v2"))
+	// Compute a valid root CID using the SDK's CID computation.
+	rootCID, err := ipfar.ComputeCID([]byte("hello cbor car v2"))
 	if err != nil {
-		t.Fatalf("AddRawBlock failed: %v", err)
+		t.Fatalf("ComputeCID failed: %v", err)
 	}
 
 	// Manually encode the data block

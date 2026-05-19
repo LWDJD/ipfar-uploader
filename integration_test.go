@@ -16,27 +16,58 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 
+	"github.com/LWDJD/ipfar-sdk/ipfar"
+	sdkpow "github.com/LWDJD/ipfar-sdk/pow"
 	"github.com/LWDJD/ipfar-sdk/verify/ipfs"
 	sdkmetadata "github.com/LWDJD/ipfar-sdk/verify/metadata"
 	"github.com/LWDJD/ipfar-sdk/verify/pipeline"
 
-	"github.com/LWDJD/ipfar-uploader/car"
 	"github.com/LWDJD/ipfar-uploader/metadata"
-	uploaderpow "github.com/LWDJD/ipfar-uploader/pow"
 )
 
 const testInputFile = "/tmp/testfile.bin"
 
-// ============================================================================
-// Fast PoW verifier matching FastComputePoW (1MB memory)
-// ============================================================================
+// fastComputePoW computes PoW using reduced memory (1 MiB) for fast testing.
+// This matches the old uploaderpow.FastComputePoW behavior.
+func fastComputePoW(rootCID, dataTXID string) (string, error) {
+	password := []byte(rootCID + dataTXID)
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	var attempts uint64
+	for {
+		salt := rng.Uint64()
+		saltBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(saltBytes, salt)
+		hash := argon2.IDKey(password, saltBytes, 1, 1024, 1, 32)
+		if hasLeadingZeroBytesLocal(hash, sdkpow.MinLeadingZeroBytes) {
+			return strconv.FormatUint(salt, 10), nil
+		}
+		attempts++
+		if attempts > 10_000_000 {
+			return "", fmt.Errorf("PoW computation exceeded safety limit")
+		}
+	}
+}
+
+func hasLeadingZeroBytesLocal(data []byte, n int) bool {
+	if len(data) < n {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if data[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
 
 func fastPoWVerify(powStr, rootCID, dataTXID string) error {
 	if powStr == "" {
@@ -51,7 +82,7 @@ func fastPoWVerify(powStr, rootCID, dataTXID string) error {
 	binary.LittleEndian.PutUint64(saltBytes, salt)
 	// Must match FastComputePoW: 1MB memory, 1 time, 1 thread, 32 bytes output
 	hash := argon2.IDKey(password, saltBytes, 1, 1024, 1, 32)
-	for i := 0; i < uploaderpow.MinLeadingZeroBytes; i++ {
+	for i := 0; i < sdkpow.MinLeadingZeroBytes; i++ {
 		if hash[i] != 0 {
 			return fmt.Errorf("insufficient leading zeros at byte %d: 0x%02x", i, hash[i])
 		}
@@ -84,10 +115,14 @@ func TestIntegration_FullPipeline(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	carPath := filepath.Join(tmpDir, "test.car")
-	rootCID, carWritten, err := car.CreateCarV2FromFile(testInputFile, carPath)
+	carBytes, rootCID, err := ipfar.BuildCarV2(fileData)
 	if err != nil {
-		t.Fatalf("❌ CreateCarV2FromFile failed: %v", err)
+		t.Fatalf("❌ BuildCarV2 failed: %v", err)
 	}
+	if err := os.WriteFile(carPath, carBytes, 0644); err != nil {
+		t.Fatalf("❌ Failed to write CAR file: %v", err)
+	}
+	carWritten := int64(len(carBytes))
 	t.Logf("✅ CAR v2 created: %s (%d bytes)", carPath, carWritten)
 	t.Logf("   Root CID: %s", rootCID.String())
 
@@ -117,12 +152,12 @@ func TestIntegration_FullPipeline(t *testing.T) {
 
 	// ── Step 4: 计算 PoW（快速模式 1MB，用于快速测试）────────────
 	t.Log("⏳ Computing PoW (fast/test mode, 1MB memory)...")
-	powResult, err := uploaderpow.FastComputePoW(rootCID.String(), meta.DataTXID)
+	powResult, err := fastComputePoW(rootCID.String(), meta.DataTXID)
 	if err != nil {
 		t.Fatalf("❌ FastComputePoW failed: %v", err)
 	}
 	meta.PoW = powResult
-	meta.PoWAlg = uploaderpow.Algorithm
+	meta.PoWAlg = sdkpow.Algorithm
 	t.Logf("✅ PoW computed: salt=%s, alg=%s", meta.PoW, meta.PoWAlg)
 
 	// 用匹配的快速验证器验证 PoW
@@ -172,7 +207,7 @@ func TestIntegration_FullPipeline(t *testing.T) {
 
 	// ── 5c: PoW 验证 ───────────────────────────────────────────
 	t.Log("\n🔐 PoW 验证:")
-	if uploaderpow.NeedsPoW(originalSize) {
+	if sdkpow.NeedsPoW(originalSize) {
 		t.Log("   File < 100MB → PoW required")
 
 		if meta.PoWAlg != "argon2id-light-v1" {
@@ -412,7 +447,7 @@ func TestIntegration_CARv2_SelfConsistency(t *testing.T) {
 		t.Fatalf("Failed to read test file: %v", err)
 	}
 
-	carBytes, rootCID1, err := car.CreateCarV2FromBytes(fileData)
+	carBytes, rootCID1, err := ipfar.BuildCarV2(fileData)
 	if err != nil {
 		t.Fatalf("CreateCarV2FromBytes failed: %v", err)
 	}
@@ -420,9 +455,13 @@ func TestIntegration_CARv2_SelfConsistency(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "ipfar-consistency-*")
 	defer os.RemoveAll(tmpDir)
 	carPath := filepath.Join(tmpDir, "test.car")
-	rootCID2, _, err := car.CreateCarV2FromFile(testInputFile, carPath)
+	_, rootCID2, err := ipfar.BuildCarV2(fileData)
 	if err != nil {
-		t.Fatalf("CreateCarV2FromFile failed: %v", err)
+		t.Fatalf("BuildCarV2 failed: %v", err)
+	}
+	// Write to file for CAR parser
+	if err := os.WriteFile(carPath, carBytes, 0644); err != nil {
+		t.Fatalf("Failed to write CAR file: %v", err)
 	}
 
 	if rootCID1.String() != rootCID2.String() {
