@@ -1,193 +1,21 @@
 // Package uploader — remote CAR verification for dedup safety.
+//
+// After phase 4, VerifyRemoteCAR and VerifyRemoteMeta delegate to the
+// ipfar-sdk which provides multi‑gateway fallback and CAR parsing.
 package uploader
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/binary"
-	"encoding/json"
-	"fmt"
-	"io"
-	"strconv"
-	"strings"
 
+	"github.com/LWDJD/ipfar-sdk/ipfar"
 	"github.com/LWDJD/ipfar-uploader/arweave"
-	sdkcar "github.com/LWDJD/ipfar-sdk/verify/ipfs"
-	"github.com/ipfs/go-cid"
 )
 
-// fallbackGatewayURLs are public Arweave gateways tried when the primary
-// gateway fails to serve raw transaction data (404 or network error).
-// The list is deduplicated against the primary gateway at runtime.
-var fallbackGatewayURLs = []string{
-	"https://ar-io.dev",
-	"https://arweave.net",
-}
-
-// remoteCarReader implements io.ReaderAt over HTTP range requests to an
-// Arweave gateway.  Each ReadAt call issues a single range request; the
-// SDK's CarParser only touches the header / index regions so the total
-// number of round-trips is small.
-type remoteCarReader struct {
-	gateway *arweave.GatewayClient
-	txID    string
-	size    int64 // total file size in bytes
-	ctx     context.Context
-}
-
-func newRemoteCarReader(ctx context.Context, gateway *arweave.GatewayClient, txID string, size int64) *remoteCarReader {
-	return &remoteCarReader{
-		gateway: gateway,
-		txID:    txID,
-		size:    size,
-		ctx:     ctx,
-	}
-}
-
-// ReadAt implements io.ReaderAt.
-func (r *remoteCarReader) ReadAt(p []byte, off int64) (n int, err error) {
-	if off >= r.size {
-		return 0, io.EOF
-	}
-
-	end := off + int64(len(p)) - 1
-	if end >= r.size {
-		end = r.size - 1
-	}
-
-	data, err := r.gateway.DownloadTransactionDataRange(r.ctx, r.txID, off, end)
-	if err != nil {
-		return 0, fmt.Errorf("remote read [%d-%d]: %w", off, end, err)
-	}
-
-	n = copy(p, data)
-	if off+int64(n) >= r.size {
-		return n, io.EOF
-	}
-	return n, nil
-}
-
-// carv2Pragma is the legacy non‑standard CAR v2 pragma.
-var carv2Pragma = []byte{0x63, 0x61, 0x72, 0x02} // "car\x02"
-
-// carv2SpecPragma is the CBOR-encoded CAR v2 pragma: {"version": 2}
-var carv2SpecPragma = []byte{
-	0x0a,                                     // uint(10) — outer CBOR length
-	0xa1,                                     // map(1)
-	0x67,                                     // string(7)
-	0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, // "version"
-	0x02,                                     // uint(2)
-}
-
-// parseV2Header validates the CAR v2 header bytes and returns the total
-// file size derived from the header fields (legacy format only).  For
-// standard CBOR format the returned size is 0 — the caller must obtain
-// the total size from the HTTP Content-Range header instead.
-//
-// The function also checks that:
-//   - dataOffset is non-zero
-//   - indexOffset is non-zero (index is present)
-//   - data section fits before the index (legacy only)
-func parseV2Header(buf []byte) (derivedSize int64, err error) {
-	if len(buf) < 11 {
-		return 0, fmt.Errorf("buffer too small for CAR header: %d bytes", len(buf))
-	}
-
-	// ── Legacy format ("car\x02") ───────────────────────────────────
-	if bytes.Equal(buf[:4], carv2Pragma) {
-		if len(buf) < 52 {
-			return 0, fmt.Errorf("buffer too small for legacy v2 header (need 52, got %d)", len(buf))
-		}
-		hdr := buf[4:52] // 48-byte legacy header
-
-		dataOffset := binary.LittleEndian.Uint64(hdr[16:24])
-		dataSize := binary.LittleEndian.Uint64(hdr[24:32])
-		indexOffset := binary.LittleEndian.Uint64(hdr[32:40])
-		indexSize := binary.LittleEndian.Uint64(hdr[40:48])
-
-		if dataOffset == 0 {
-			return 0, fmt.Errorf("invalid data offset in legacy CAR v2 header")
-		}
-		if indexOffset == 0 || indexSize == 0 {
-			return 0, fmt.Errorf("CAR v2 has no index (indexOffset=%d, indexSize=%d)", indexOffset, indexSize)
-		}
-
-		total := int64(indexOffset + indexSize)
-
-		// Sanity: data section must fit before the index.
-		if int64(dataOffset+dataSize) > total {
-			return 0, fmt.Errorf("CAR v2 header: data section extends beyond file (dataEnd=%d, total=%d)",
-				dataOffset+dataSize, total)
-		}
-
-		return total, nil
-	}
-
-	// ── Standard CBOR format ────────────────────────────────────────
-	if bytes.Equal(buf[:len(carv2SpecPragma)], carv2SpecPragma) {
-		if len(buf) < 51 {
-			return 0, fmt.Errorf("buffer too small for standard v2 header (need 51, got %d)", len(buf))
-		}
-		hdr := buf[11:51] // 40-byte standard header
-
-		dataOffset := binary.LittleEndian.Uint64(hdr[16:24])
-		indexOffset := binary.LittleEndian.Uint64(hdr[32:40])
-
-		if dataOffset == 0 {
-			return 0, fmt.Errorf("invalid data offset in standard CAR v2 header")
-		}
-		if indexOffset == 0 {
-			return 0, fmt.Errorf("CAR v2 has no index (indexOffset=0)")
-		}
-
-		// IndexSize is not in the header; size must come from Content-Range.
-		return 0, nil
-	}
-
-	return 0, fmt.Errorf("unknown CAR pragma: %x", buf[:minInt(len(buf), 16)])
-}
-
-// minInt returns the smaller of a and b.
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// parseContentRangeTotal extracts the total file size from a Content-Range
-// header value like "bytes 0-199/1048746".  Returns an error if the header
-// is missing, malformed, or has an unknown total (*).
-func parseContentRangeTotal(cr string) (int64, error) {
-	if cr == "" {
-		return 0, fmt.Errorf("Content-Range header missing")
-	}
-	slash := strings.LastIndexByte(cr, '/')
-	if slash < 0 {
-		return 0, fmt.Errorf("malformed Content-Range %q", cr)
-	}
-	totalStr := cr[slash+1:]
-	if totalStr == "*" {
-		return 0, fmt.Errorf("Content-Range has unknown total (*)")
-	}
-	total, err := strconv.ParseInt(totalStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid Content-Range total %q: %w", totalStr, err)
-	}
-	if total <= 0 {
-		return 0, fmt.Errorf("Content-Range total <= 0 (%d)", total)
-	}
-	return total, nil
-}
-
 // VerifyRemoteCAR downloads key portions of a remote CAR file from Arweave
-// and validates it using the SDK's CAR parser (ipfar-sdk/verify/ipfs).
+// and validates it using the SDK's CAR parser.
 //
-// Multi‑gateway fallback: if the primary gateway returns 404 or a network
-// error when serving raw transaction data, alternate public gateways are
-// tried in sequence.  If every gateway returns 404 the function falls back
-// to trusting on‑chain confirmation (at least 1 confirmation).
+// The primary gateway is tried first; if it fails the SDK falls back to
+// public gateways (ipfar.DefaultFallbackGateways).
 //
 // Checks performed (when raw data is reachable):
 //  1. CAR version == 2
@@ -195,220 +23,20 @@ func parseContentRangeTotal(cr string) (int64, error) {
 //  3. Root CID matches expectedRootCID
 //  4. Index passes ValidateIndex (boundary sanity)
 //
-// Returns (true, nil) when the CAR passes every check, or when the trust
-// fallback is engaged.
+// Returns (true, nil) when the CAR passes every check.
 func VerifyRemoteCAR(ctx context.Context, gateway *arweave.GatewayClient, txID string, expectedRootCID string) (bool, error) {
-	// Collect unique gateway URLs (primary + fallbacks, deduplicated).
-	gwURLs := collectGatewayURLs(gateway)
-
-	var lastErr error
-	allNotFound := true
-
-	for _, gwURL := range gwURLs {
-		debugLog("VerifyRemoteCAR: trying gateway %s", gwURL)
-		gw := arweave.NewGatewayClient(gwURL)
-		verified, err := verifyRemoteCARWithGateway(ctx, gw, txID, expectedRootCID)
-		if err == nil && verified {
-			debugLog("VerifyRemoteCAR: success via %s", gwURL)
-			return true, nil
-		}
-		debugLog("VerifyRemoteCAR: gateway %s failed: %v", gwURL, err)
-		lastErr = err
-		if !isNotFoundError(err) {
-			allNotFound = false
-		}
-	}
-
-	// ── All gateways returned 404 — cannot verify, trigger fresh upload ──
-	if allNotFound {
-		return false, fmt.Errorf("unable to verify CAR %s via any public gateway", txID)
-	}
-
-	if lastErr != nil {
-		return false, fmt.Errorf("all gateways failed to verify CAR %s: %w", txID, lastErr)
-	}
-	return false, fmt.Errorf("all gateways failed to verify CAR %s", txID)
-}
-
-// verifyRemoteCARWithGateway attempts to verify a remote CAR using a single
-// gateway.  It is the per‑gateway workhorse called by VerifyRemoteCAR.
-func verifyRemoteCARWithGateway(ctx context.Context, gateway *arweave.GatewayClient, txID string, expectedRootCID string) (bool, error) {
-	// ── 1. Get file size from /tx/{txID} ────────────────────────────
-	fileSize, err := gateway.GetTransactionDataSize(ctx, txID)
-	if err != nil {
-		return false, fmt.Errorf("failed to get data size from /tx/%s: %w", txID, err)
-	}
-
-	// ── 2. Create SDK parser backed by remote reader ────────────────
-	reader := newRemoteCarReader(ctx, gateway, txID, fileSize)
-	parser, err := sdkcar.NewCarParserFromReader(reader, fileSize)
-	if err != nil {
-		return false, fmt.Errorf("failed to create CAR parser: %w", err)
-	}
-	defer parser.Close()
-
-	// ── 3. Parse CAR metadata (headers only) ────────────────────────
-	info, err := parser.ParseInfo()
-	if err != nil {
-		return false, fmt.Errorf("failed to parse CAR info: %w", err)
-	}
-
-	// ── 4. Check version ────────────────────────────────────────────
-	if info.Version != 2 {
-		return false, fmt.Errorf("expected CAR v2, got v%d", info.Version)
-	}
-
-	// ── 5. Check index presence ─────────────────────────────────────
-	if !info.HasIndex {
-		return false, fmt.Errorf("CAR file has no index")
-	}
-
-	// ── 6. Root CID match ───────────────────────────────────────────
-	expectedCID, err := cid.Decode(expectedRootCID)
-	if err != nil {
-		return false, fmt.Errorf("invalid expected root CID %q: %w", expectedRootCID, err)
-	}
-
-	found := false
-	for _, root := range info.Roots {
-		if root.Equals(expectedCID) {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return false, fmt.Errorf("root CID mismatch: expected %s, roots in CAR: %v",
-			expectedRootCID, info.Roots)
-	}
-
-	// ── 7. Validate index integrity ─────────────────────────────────
-	if err := parser.ValidateIndex(); err != nil {
-		return false, fmt.Errorf("index validation failed: %w", err)
-	}
-
-	return true, nil
-}
-
-// collectGatewayURLs returns a deduplicated list of gateway URLs starting
-// with the primary gateway followed by fallbackGatewayURLs.
-func collectGatewayURLs(primary *arweave.GatewayClient) []string {
-	seen := make(map[string]bool)
-	var urls []string
-
-	primaryURL := strings.TrimRight(primary.GatewayURL, "/")
-	seen[primaryURL] = true
-	urls = append(urls, primaryURL)
-
-	for _, u := range fallbackGatewayURLs {
-		u = strings.TrimRight(u, "/")
-		if !seen[u] {
-			seen[u] = true
-			urls = append(urls, u)
-		}
-	}
-	return urls
+	return ipfar.VerifyRemoteCAR(ctx, gateway.GatewayClient, txID, expectedRootCID, nil)
 }
 
 // VerifyRemoteMeta downloads the raw metadata transaction from Arweave and
 // validates that its root_cid and data_txid match the expected values.
 //
-// Multi-gateway fallback: if the primary gateway returns 404 or a network
-// error when serving raw transaction data, alternate public gateways are
-// tried in sequence.
-//
-// The remote data may be plain JSON or base64url-encoded JSON (chunked
-// upload stores data base64url-encoded).  Both forms are tried.
+// Multi-gateway fallback is handled by the SDK.  The remote data may be
+// plain JSON or base64url-encoded JSON (chunked upload stores data
+// base64url-encoded).  Both forms are tried.
 //
 // Returns true if the remote metadata is valid and matches the expected
 // rootCID and dataTXID.
 func VerifyRemoteMeta(ctx context.Context, gateway *arweave.GatewayClient, txID, expectedRootCID, expectedDataTXID string) (bool, error) {
-	gwURLs := collectGatewayURLs(gateway)
-
-	var lastErr error
-	allNotFound := true
-
-	for _, gwURL := range gwURLs {
-		debugLog("VerifyRemoteMeta: trying gateway %s", gwURL)
-		gw := arweave.NewGatewayClient(gwURL)
-		verified, err := verifyRemoteMetaWithGateway(ctx, gw, txID, expectedRootCID, expectedDataTXID)
-		if err == nil && verified {
-			debugLog("VerifyRemoteMeta: success via %s", gwURL)
-			return true, nil
-		}
-		debugLog("VerifyRemoteMeta: gateway %s failed: %v", gwURL, err)
-		lastErr = err
-		if !isNotFoundError(err) {
-			allNotFound = false
-		}
-	}
-
-	if allNotFound {
-		return false, fmt.Errorf("unable to verify metadata %s via any public gateway", txID)
-	}
-	if lastErr != nil {
-		return false, fmt.Errorf("all gateways failed to verify metadata %s: %w", txID, lastErr)
-	}
-	return false, fmt.Errorf("all gateways failed to verify metadata %s", txID)
-}
-
-// verifyRemoteMetaWithGateway attempts to verify remote metadata using a
-// single gateway.
-func verifyRemoteMetaWithGateway(ctx context.Context, gateway *arweave.GatewayClient, txID, expectedRootCID, expectedDataTXID string) (bool, error) {
-	// Download full raw transaction data via GET /raw/{txID} or /{txID}
-	rawData, err := gateway.DownloadTransactionData(ctx, txID)
-	if err != nil {
-		return false, fmt.Errorf("failed to download metadata tx %s: %w", txID, err)
-	}
-
-	// Try to parse the data.  It might be:
-	// 1. Plain JSON (legacy / direct upload)
-	// 2. Base64url-encoded JSON (chunked upload via goar)
-	//
-	// Define the struct once for both plain JSON and decoded attempts.
-	type metaFields struct {
-		RootCID  string `json:"root_cid"`
-		DataTXID string `json:"data_txid"`
-	}
-
-	// First try plain JSON.
-	var mf metaFields
-	if parseErr := json.Unmarshal(rawData, &mf); parseErr == nil {
-		if mf.RootCID == expectedRootCID && mf.DataTXID == expectedDataTXID {
-			return true, nil
-		}
-		return false, fmt.Errorf("metadata content mismatch: expected root_cid=%s data_txid=%s, got root_cid=%s data_txid=%s",
-			expectedRootCID, expectedDataTXID, mf.RootCID, mf.DataTXID)
-	}
-
-	// Try base64url decode
-	decoded, decodeErr := base64.RawURLEncoding.DecodeString(string(rawData))
-	if decodeErr != nil {
-		// Also try standard base64
-		decoded, decodeErr = base64.StdEncoding.DecodeString(string(rawData))
-	}
-	if decodeErr != nil {
-		return false, fmt.Errorf("metadata is neither valid JSON nor base64url: %w", decodeErr)
-	}
-
-	if err := json.Unmarshal(decoded, &mf); err != nil {
-		return false, fmt.Errorf("failed to parse decoded metadata JSON: %w", err)
-	}
-
-	if mf.RootCID != expectedRootCID || mf.DataTXID != expectedDataTXID {
-		return false, fmt.Errorf("metadata content mismatch after decode: expected root_cid=%s data_txid=%s, got root_cid=%s data_txid=%s",
-			expectedRootCID, expectedDataTXID, mf.RootCID, mf.DataTXID)
-	}
-
-	return true, nil
-}
-
-// isNotFoundError returns true when err indicates an HTTP 404 from a gateway.
-func isNotFoundError(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	return strings.Contains(s, "gateway returned 404") ||
-		strings.Contains(s, " 404 ") ||
-		strings.HasSuffix(s, "404")
+	return ipfar.VerifyRemoteMeta(ctx, gateway.GatewayClient, txID, expectedRootCID, expectedDataTXID, nil)
 }
