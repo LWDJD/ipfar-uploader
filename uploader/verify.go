@@ -4,7 +4,9 @@ package uploader
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
@@ -305,6 +307,99 @@ func collectGatewayURLs(primary *arweave.GatewayClient) []string {
 		}
 	}
 	return urls
+}
+
+// VerifyRemoteMeta downloads the raw metadata transaction from Arweave and
+// validates that its root_cid and data_txid match the expected values.
+//
+// Multi-gateway fallback: if the primary gateway returns 404 or a network
+// error when serving raw transaction data, alternate public gateways are
+// tried in sequence.
+//
+// The remote data may be plain JSON or base64url-encoded JSON (chunked
+// upload stores data base64url-encoded).  Both forms are tried.
+//
+// Returns true if the remote metadata is valid and matches the expected
+// rootCID and dataTXID.
+func VerifyRemoteMeta(ctx context.Context, gateway *arweave.GatewayClient, txID, expectedRootCID, expectedDataTXID string) (bool, error) {
+	gwURLs := collectGatewayURLs(gateway)
+
+	var lastErr error
+	allNotFound := true
+
+	for _, gwURL := range gwURLs {
+		debugLog("VerifyRemoteMeta: trying gateway %s", gwURL)
+		gw := arweave.NewGatewayClient(gwURL)
+		verified, err := verifyRemoteMetaWithGateway(ctx, gw, txID, expectedRootCID, expectedDataTXID)
+		if err == nil && verified {
+			debugLog("VerifyRemoteMeta: success via %s", gwURL)
+			return true, nil
+		}
+		debugLog("VerifyRemoteMeta: gateway %s failed: %v", gwURL, err)
+		lastErr = err
+		if !isNotFoundError(err) {
+			allNotFound = false
+		}
+	}
+
+	if allNotFound {
+		return false, fmt.Errorf("unable to verify metadata %s via any public gateway", txID)
+	}
+	if lastErr != nil {
+		return false, fmt.Errorf("all gateways failed to verify metadata %s: %w", txID, lastErr)
+	}
+	return false, fmt.Errorf("all gateways failed to verify metadata %s", txID)
+}
+
+// verifyRemoteMetaWithGateway attempts to verify remote metadata using a
+// single gateway.
+func verifyRemoteMetaWithGateway(ctx context.Context, gateway *arweave.GatewayClient, txID, expectedRootCID, expectedDataTXID string) (bool, error) {
+	// Download full raw transaction data via GET /raw/{txID} or /{txID}
+	rawData, err := gateway.DownloadTransactionData(ctx, txID)
+	if err != nil {
+		return false, fmt.Errorf("failed to download metadata tx %s: %w", txID, err)
+	}
+
+	// Try to parse the data.  It might be:
+	// 1. Plain JSON (legacy / direct upload)
+	// 2. Base64url-encoded JSON (chunked upload via goar)
+	//
+	// Define the struct once for both plain JSON and decoded attempts.
+	type metaFields struct {
+		RootCID  string `json:"root_cid"`
+		DataTXID string `json:"data_txid"`
+	}
+
+	// First try plain JSON.
+	var mf metaFields
+	if parseErr := json.Unmarshal(rawData, &mf); parseErr == nil {
+		if mf.RootCID == expectedRootCID && mf.DataTXID == expectedDataTXID {
+			return true, nil
+		}
+		return false, fmt.Errorf("metadata content mismatch: expected root_cid=%s data_txid=%s, got root_cid=%s data_txid=%s",
+			expectedRootCID, expectedDataTXID, mf.RootCID, mf.DataTXID)
+	}
+
+	// Try base64url decode
+	decoded, decodeErr := base64.RawURLEncoding.DecodeString(string(rawData))
+	if decodeErr != nil {
+		// Also try standard base64
+		decoded, decodeErr = base64.StdEncoding.DecodeString(string(rawData))
+	}
+	if decodeErr != nil {
+		return false, fmt.Errorf("metadata is neither valid JSON nor base64url: %w", decodeErr)
+	}
+
+	if err := json.Unmarshal(decoded, &mf); err != nil {
+		return false, fmt.Errorf("failed to parse decoded metadata JSON: %w", err)
+	}
+
+	if mf.RootCID != expectedRootCID || mf.DataTXID != expectedDataTXID {
+		return false, fmt.Errorf("metadata content mismatch after decode: expected root_cid=%s data_txid=%s, got root_cid=%s data_txid=%s",
+			expectedRootCID, expectedDataTXID, mf.RootCID, mf.DataTXID)
+	}
+
+	return true, nil
 }
 
 // isNotFoundError returns true when err indicates an HTTP 404 from a gateway.

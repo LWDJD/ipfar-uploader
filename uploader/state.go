@@ -321,17 +321,22 @@ func ComputeFileHash(filePath string) (string, error) {
 // =============================================================================
 
 // ShouldAttemptDedup returns true when the uploader should query GraphQL
-// to check for an existing CAR transaction on chain.
+// to check for an existing transaction on chain.
 //
 // Rules:
-//   - Always attempt dedup when status is pending or car_uploading
-//     (the earliest phases, before any tx is known).
-//   - If CarTXID is already known (non-empty), skip dedup — we already
-//     have a transaction to track.
-//   - If CarTXID is empty, attempt dedup — we might find an existing
-//     upload from a previous (possibly failed) run or from another uploader.
+//   - Always attempt dedup when status is pending, car_uploading, or
+//     car_confirmed (with empty MetaTXID) — the phases where we haven't
+//     yet confirmed a local transaction.
+//   - If CarTXID is already known (non-empty) AND MetaTXID is also known,
+//     skip dedup — we already have both transactions tracked.
+//   - If MetaTXID is empty, attempt dedup — we might find an existing
+//     upload from a previous run.
 func (s *UploadState) ShouldAttemptDedup() bool {
 	if s.Status == StatusPending || s.Status == StatusCarUploading {
+		return true
+	}
+	// After CAR confirmed, still attempt metadata dedup if MetaTXID is empty
+	if s.Status == StatusCarConfirmed && s.MetaTXID == "" {
 		return true
 	}
 	return s.CarTXID == ""

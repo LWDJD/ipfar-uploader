@@ -150,6 +150,11 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 		}
 	}
 
+	// ── Metadata dedup ───────────────────────────────────────────────
+	if state.ShouldAttemptDedup() && state.CarConfirmed && state.MetaTXID == "" {
+		u.dedupCheckMeta(ctx, result, state)
+	}
+
 	// ── Metadata confirmation check (submitted but not confirmed) ────
 	if state.NeedsMetaConfirmation() {
 		u.handleMetaResume(ctx, result, state)
@@ -198,7 +203,8 @@ func (u *Uploader) uploadCarWithState(ctx context.Context, result *UploadResult,
 	case metadata.MethodRaw:
 		return u.uploadCarRaw(ctx, result, carBytes, state, cachePath, arTags)
 	case metadata.MethodBundle:
-		return u.uploadCarBundle(ctx, result, carBytes, state, cachePath, arTags)
+		// TODO(phase-5): re-enable bundle upload once SDK bundle support is ready.
+		return fmt.Errorf("bundle upload not yet implemented (phase 5)")
 	default:
 		return fmt.Errorf("unknown method: %s", state.Method)
 	}
@@ -308,149 +314,153 @@ func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult
 	return nil
 }
 
-// uploadCarBundle uploads CAR+meta as a single bundle tx with state tracking.
-func (u *Uploader) uploadCarBundle(ctx context.Context, result *UploadResult, carBytes []byte, state *UploadState, cachePath string, arTags []arweave.Tag) error {
-	debugLog("uploadCarBundle: starting, rootCID=%s, dataSize=%d", result.RootCID, result.DataSize)
-	if state.CarConfirmed {
-		result.DataTXID = state.CarTXID
-		result.DataHeight = state.CarHeight
-		result.BundleTXID = state.BundleTXID
-		result.MetaTXID = state.MetaTXID
-		return nil
-	}
+/*
+// // uploadCarBundle uploads CAR+meta as a single bundle tx with state tracking.
+// func (u *Uploader) uploadCarBundle(ctx context.Context, result *UploadResult, carBytes []byte, state *UploadState, cachePath string, arTags []arweave.Tag) error {
+// 	debugLog("uploadCarBundle: starting, rootCID=%s, dataSize=%d", result.RootCID, result.DataSize)
+// 	if state.CarConfirmed {
+// 		result.DataTXID = state.CarTXID
+// 		result.DataHeight = state.CarHeight
+// 		result.BundleTXID = state.BundleTXID
+// 		result.MetaTXID = state.MetaTXID
+// 		return nil
+// 	}
+// 
+// 	// Sign CAR data as a bundle item
+// 	carItem, err := arweave.SignBundleItem(carBytes, arTags, u.cfg.Wallet, nil)
+// 	if err != nil {
+// 		state.SetError(fmt.Errorf("failed to sign CAR bundle item: %w", err))
+// 		state.Save()
+// 		return stateError(state)
+// 	}
+// 	carItemID := base64.RawURLEncoding.EncodeToString(carItem.ID)
+// 	result.DataTXID = carItemID
+// 	fmt.Printf("   CAR item signed: %s\n", carItemID)
+// 
+// 	// Compute PoW
+// 	if pow.NeedsPoW(result.DataSize) {
+// 		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
+// 			return err
+// 		}
+// 	} else {
+// 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
+// 	}
+// 
+// 	// Build metadata
+// 	result.DataHeight = -1
+// 	result.BundleTXID = "none"
+// 
+// 	meta := &metadata.Metadata{
+// 		Version:      metadata.Version1,
+// 		Method:       metadata.MethodBundle,
+// 		RootCID:      result.RootCID,
+// 		DataTXID:     result.DataTXID,
+// 		BundleTXID:   result.BundleTXID,
+// 		DataHeight:   result.DataHeight,
+// 		DataSize:     int(result.DataSize),
+// 		ContentType:  result.ContentType,
+// 		OriginalName: result.OriginalName,
+// 	}
+// 	if pow.NeedsPoW(result.DataSize) {
+// 		meta.PoW = result.PoW
+// 		meta.PoWAlg = pow.Algorithm
+// 	}
+// 
+// 	metaJSON, err := meta.ToJSON()
+// 	if err != nil {
+// 		state.SetError(fmt.Errorf("failed to serialize metadata: %w", err))
+// 		state.Save()
+// 		return stateError(state)
+// 	}
+// 	metaBase64 := base64.RawURLEncoding.EncodeToString(metaJSON)
+// 
+// 	// Sign metadata as a bundle item
+// 	metaTags := metadata.BuildMetaTags(result.RootCID, result.DataTXID)
+// 	metaArTags := toArweaveTags(metaTags)
+// 	metaItem, err := arweave.SignBundleItem([]byte(metaBase64), metaArTags, u.cfg.Wallet, nil)
+// 	if err != nil {
+// 		state.SetError(fmt.Errorf("failed to sign metadata bundle item: %w", err))
+// 		state.Save()
+// 		return stateError(state)
+// 	}
+// 	metaItemID := base64.RawURLEncoding.EncodeToString(metaItem.ID)
+// 	result.MetaTXID = metaItemID
+// 	fmt.Printf("   Metadata item signed: %s\n", metaItemID)
+// 
+// 	// Build bundle
+// 	bb := arweave.NewBundleBuilder()
+// 	bb.AddItem(*carItem)
+// 	bb.AddItem(*metaItem)
+// 	bundleData, err := bb.Build()
+// 	if err != nil {
+// 		state.SetError(fmt.Errorf("failed to build bundle: %w", err))
+// 		state.Save()
+// 		return stateError(state)
+// 	}
+// 
+// 	state.TransitionTo(StatusCarUploading)
+// 	state.Save()
+// 
+// 	// ── Submit bundle (chunked if large) ──────────────────────────────
+// 	bundleTXID, bundleHeight, err := u.submitBundleData(ctx, bundleData)
+// 	if err != nil {
+// 		state.SetError(fmt.Errorf("bundle upload failed: %w", err))
+// 		state.Save()
+// 		return stateError(state)
+// 	}
+// 
+// 	state.CarTXID = bundleTXID // the bundle tx is the "CAR tx" for state tracking
+// 	state.BundleTXID = bundleTXID
+// 	state.CarSubmittedAt = TimeNow()
+// 	state.CarConfirmed = true
+// 	state.CarHeight = bundleHeight
+// 	state.MetaTXID = metaItemID
+// 	state.MetaConfirmed = true
+// 	state.MetaHeight = bundleHeight
+// 	state.RetryCount = 0
+// 	state.LastError = ""
+// 	state.Status = StatusDone
+// 	state.Save()
+// 
+// 	result.DataTXID = carItemID
+// 	result.DataHeight = -1
+// 	result.BundleTXID = bundleTXID
+// 	result.MetaTXID = metaItemID
+// 	fmt.Printf("   Bundle confirmed at height=%d\n", bundleHeight)
+// 
+// 	return nil
+// }
+*/
 
-	// Sign CAR data as a bundle item
-	carItem, err := arweave.SignBundleItem(carBytes, arTags, u.cfg.Wallet, nil)
-	if err != nil {
-		state.SetError(fmt.Errorf("failed to sign CAR bundle item: %w", err))
-		state.Save()
-		return stateError(state)
-	}
-	carItemID := base64.RawURLEncoding.EncodeToString(carItem.ID)
-	result.DataTXID = carItemID
-	fmt.Printf("   CAR item signed: %s\n", carItemID)
-
-	// Compute PoW
-	if pow.NeedsPoW(result.DataSize) {
-		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
-			return err
-		}
-	} else {
-		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
-	}
-
-	// Build metadata
-	result.DataHeight = -1
-	result.BundleTXID = "none"
-
-	meta := &metadata.Metadata{
-		Version:      metadata.Version1,
-		Method:       metadata.MethodBundle,
-		RootCID:      result.RootCID,
-		DataTXID:     result.DataTXID,
-		BundleTXID:   result.BundleTXID,
-		DataHeight:   result.DataHeight,
-		DataSize:     int(result.DataSize),
-		ContentType:  result.ContentType,
-		OriginalName: result.OriginalName,
-	}
-	if pow.NeedsPoW(result.DataSize) {
-		meta.PoW = result.PoW
-		meta.PoWAlg = pow.Algorithm
-	}
-
-	metaJSON, err := meta.ToJSON()
-	if err != nil {
-		state.SetError(fmt.Errorf("failed to serialize metadata: %w", err))
-		state.Save()
-		return stateError(state)
-	}
-	metaBase64 := base64.RawURLEncoding.EncodeToString(metaJSON)
-
-	// Sign metadata as a bundle item
-	metaTags := metadata.BuildMetaTags(result.RootCID, result.DataTXID)
-	metaArTags := toArweaveTags(metaTags)
-	metaItem, err := arweave.SignBundleItem([]byte(metaBase64), metaArTags, u.cfg.Wallet, nil)
-	if err != nil {
-		state.SetError(fmt.Errorf("failed to sign metadata bundle item: %w", err))
-		state.Save()
-		return stateError(state)
-	}
-	metaItemID := base64.RawURLEncoding.EncodeToString(metaItem.ID)
-	result.MetaTXID = metaItemID
-	fmt.Printf("   Metadata item signed: %s\n", metaItemID)
-
-	// Build bundle
-	bb := arweave.NewBundleBuilder()
-	bb.AddItem(*carItem)
-	bb.AddItem(*metaItem)
-	bundleData, err := bb.Build()
-	if err != nil {
-		state.SetError(fmt.Errorf("failed to build bundle: %w", err))
-		state.Save()
-		return stateError(state)
-	}
-
-	state.TransitionTo(StatusCarUploading)
-	state.Save()
-
-	// ── Submit bundle (chunked if large) ──────────────────────────────
-	bundleTXID, bundleHeight, err := u.submitBundleData(ctx, bundleData)
-	if err != nil {
-		state.SetError(fmt.Errorf("bundle upload failed: %w", err))
-		state.Save()
-		return stateError(state)
-	}
-
-	state.CarTXID = bundleTXID // the bundle tx is the "CAR tx" for state tracking
-	state.BundleTXID = bundleTXID
-	state.CarSubmittedAt = TimeNow()
-	state.CarConfirmed = true
-	state.CarHeight = bundleHeight
-	state.MetaTXID = metaItemID
-	state.MetaConfirmed = true
-	state.MetaHeight = bundleHeight
-	state.RetryCount = 0
-	state.LastError = ""
-	state.Status = StatusDone
-	state.Save()
-
-	result.DataTXID = carItemID
-	result.DataHeight = -1
-	result.BundleTXID = bundleTXID
-	result.MetaTXID = metaItemID
-	fmt.Printf("   Bundle confirmed at height=%d\n", bundleHeight)
-
-	return nil
-}
-
-// submitBundleData uploads the bundle binary.  For data >= ChunkSize the
-// chunked endpoint is used; otherwise a direct POST /tx is attempted.
-func (u *Uploader) submitBundleData(ctx context.Context, bundleData []byte) (string, int, error) {
-	if len(bundleData) >= arweave.ChunkSize {
-		fmt.Printf("   Uploading bundle via chunked upload (%d bytes)...\n", len(bundleData))
-		// Use empty tags for the bundle transaction itself; the bundle
-		// items carry their own tags internally.
-		tx, status, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, bundleData, nil)
-		if err != nil {
-			return "", 0, err
-		}
-		return tx.ID, status.BlockHeight, nil
-	}
-
-	fmt.Printf("   Uploading bundle (2 items, %d bytes)...\n", len(bundleData))
-	txID, err := u.cfg.Gateway.UploadDataRaw(ctx, bundleData)
-	if err != nil {
-		return "", 0, err
-	}
-
-	fmt.Printf("   Bundle submitted: %s\n", txID)
-	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, txID, 120, 3*time.Second)
-	if err != nil {
-		return txID, 0, fmt.Errorf("bundle confirmation timeout (txid saved for resume): %w", err)
-	}
-	return txID, status.BlockHeight, nil
-}
+/*
+// // submitBundleData uploads the bundle binary.  For data >= ChunkSize the
+// // chunked endpoint is used; otherwise a direct POST /tx is attempted.
+// func (u *Uploader) submitBundleData(ctx context.Context, bundleData []byte) (string, int, error) {
+// 	if len(bundleData) >= arweave.ChunkSize {
+// 		fmt.Printf("   Uploading bundle via chunked upload (%d bytes)...\n", len(bundleData))
+// 		// Use empty tags for the bundle transaction itself; the bundle
+// 		// items carry their own tags internally.
+// 		tx, status, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, bundleData, nil)
+// 		if err != nil {
+// 			return "", 0, err
+// 		}
+// 		return tx.ID, status.BlockHeight, nil
+// 	}
+// 
+// 	fmt.Printf("   Uploading bundle (2 items, %d bytes)...\n", len(bundleData))
+// 	txID, err := u.cfg.Gateway.UploadDataRaw(ctx, bundleData)
+// 	if err != nil {
+// 		return "", 0, err
+// 	}
+// 
+// 	fmt.Printf("   Bundle submitted: %s\n", txID)
+// 	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, txID, 120, 3*time.Second)
+// 	if err != nil {
+// 		return txID, 0, fmt.Errorf("bundle confirmation timeout (txid saved for resume): %w", err)
+// 	}
+// 	return txID, status.BlockHeight, nil
+// }
+*/
 
 // =============================================================================
 // Metadata upload with state tracking
@@ -741,139 +751,143 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 	return result, nil
 }
 
-// uploadBundle handles the same-bundle flow (legacy, without state).
-func (u *Uploader) uploadBundle(ctx context.Context, result *UploadResult, carBytes []byte, cachePath string, arTags []arweave.Tag) (*UploadResult, error) {
-	carItem, err := arweave.SignBundleItem(carBytes, arTags, u.cfg.Wallet, nil)
-	if err != nil {
-		result.Error = fmt.Errorf("failed to sign CAR bundle item: %w", err)
-		return result, result.Error
-	}
-	carItemID := base64.RawURLEncoding.EncodeToString(carItem.ID)
-	result.DataTXID = carItemID
-	fmt.Printf("   CAR item signed: %s\n", carItemID)
+/*
+// // uploadBundle handles the same-bundle flow (legacy, without state).
+// func (u *Uploader) uploadBundle(ctx context.Context, result *UploadResult, carBytes []byte, cachePath string, arTags []arweave.Tag) (*UploadResult, error) {
+// 	carItem, err := arweave.SignBundleItem(carBytes, arTags, u.cfg.Wallet, nil)
+// 	if err != nil {
+// 		result.Error = fmt.Errorf("failed to sign CAR bundle item: %w", err)
+// 		return result, result.Error
+// 	}
+// 	carItemID := base64.RawURLEncoding.EncodeToString(carItem.ID)
+// 	result.DataTXID = carItemID
+// 	fmt.Printf("   CAR item signed: %s\n", carItemID)
+// 
+// 	if pow.NeedsPoW(result.DataSize) {
+// 		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
+// 			result.Error = err
+// 			return result, result.Error
+// 		}
+// 	} else {
+// 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
+// 	}
+// 
+// 	result.DataHeight = -1
+// 	result.BundleTXID = "none"
+// 
+// 	meta := &metadata.Metadata{
+// 		Version:      metadata.Version1,
+// 		Method:       metadata.MethodBundle,
+// 		RootCID:      result.RootCID,
+// 		DataTXID:     result.DataTXID,
+// 		BundleTXID:   result.BundleTXID,
+// 		DataHeight:   result.DataHeight,
+// 		DataSize:     int(result.DataSize),
+// 		ContentType:  result.ContentType,
+// 		OriginalName: result.OriginalName,
+// 	}
+// 	if pow.NeedsPoW(result.DataSize) {
+// 		meta.PoW = result.PoW
+// 		meta.PoWAlg = pow.Algorithm
+// 	}
+// 
+// 	metaJSON, err := meta.ToJSON()
+// 	if err != nil {
+// 		result.Error = fmt.Errorf("failed to serialize metadata: %w", err)
+// 		return result, result.Error
+// 	}
+// 	metaBase64 := base64.RawURLEncoding.EncodeToString(metaJSON)
+// 
+// 	metaTags := metadata.BuildMetaTags(result.RootCID, result.DataTXID)
+// 	metaArTags := toArweaveTags(metaTags)
+// 	metaItem, err := arweave.SignBundleItem([]byte(metaBase64), metaArTags, u.cfg.Wallet, nil)
+// 	if err != nil {
+// 		result.Error = fmt.Errorf("failed to sign metadata bundle item: %w", err)
+// 		return result, result.Error
+// 	}
+// 	metaItemID := base64.RawURLEncoding.EncodeToString(metaItem.ID)
+// 	result.MetaTXID = metaItemID
+// 	fmt.Printf("   Metadata item signed: %s\n", metaItemID)
+// 
+// 	bb := arweave.NewBundleBuilder()
+// 	bb.AddItem(*carItem)
+// 	bb.AddItem(*metaItem)
+// 	bundleData, err := bb.Build()
+// 	if err != nil {
+// 		result.Error = fmt.Errorf("failed to build bundle: %w", err)
+// 		return result, result.Error
+// 	}
+// 
+// 	fmt.Printf("   Uploading bundle (2 items, %d bytes)...\n", len(bundleData))
+// 	bundleTXID, err := u.cfg.Gateway.UploadDataRaw(ctx, bundleData)
+// 	if err != nil {
+// 		result.Error = fmt.Errorf("bundle upload failed: %w", err)
+// 		return result, result.Error
+// 	}
+// 	fmt.Printf("   Bundle uploaded: %s\n", bundleTXID)
+// 
+// 	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, bundleTXID, 120, 3*time.Second)
+// 	if err != nil {
+// 		fmt.Printf("   Warning: bundle confirmation check failed: %v\n", err)
+// 	} else {
+// 		fmt.Printf("   Bundle confirmed at height=%d\n", status.BlockHeight)
+// 	}
+// 
+// 	return result, nil
+// }
+*/
 
-	if pow.NeedsPoW(result.DataSize) {
-		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
-			result.Error = err
-			return result, result.Error
-		}
-	} else {
-		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
-	}
-
-	result.DataHeight = -1
-	result.BundleTXID = "none"
-
-	meta := &metadata.Metadata{
-		Version:      metadata.Version1,
-		Method:       metadata.MethodBundle,
-		RootCID:      result.RootCID,
-		DataTXID:     result.DataTXID,
-		BundleTXID:   result.BundleTXID,
-		DataHeight:   result.DataHeight,
-		DataSize:     int(result.DataSize),
-		ContentType:  result.ContentType,
-		OriginalName: result.OriginalName,
-	}
-	if pow.NeedsPoW(result.DataSize) {
-		meta.PoW = result.PoW
-		meta.PoWAlg = pow.Algorithm
-	}
-
-	metaJSON, err := meta.ToJSON()
-	if err != nil {
-		result.Error = fmt.Errorf("failed to serialize metadata: %w", err)
-		return result, result.Error
-	}
-	metaBase64 := base64.RawURLEncoding.EncodeToString(metaJSON)
-
-	metaTags := metadata.BuildMetaTags(result.RootCID, result.DataTXID)
-	metaArTags := toArweaveTags(metaTags)
-	metaItem, err := arweave.SignBundleItem([]byte(metaBase64), metaArTags, u.cfg.Wallet, nil)
-	if err != nil {
-		result.Error = fmt.Errorf("failed to sign metadata bundle item: %w", err)
-		return result, result.Error
-	}
-	metaItemID := base64.RawURLEncoding.EncodeToString(metaItem.ID)
-	result.MetaTXID = metaItemID
-	fmt.Printf("   Metadata item signed: %s\n", metaItemID)
-
-	bb := arweave.NewBundleBuilder()
-	bb.AddItem(*carItem)
-	bb.AddItem(*metaItem)
-	bundleData, err := bb.Build()
-	if err != nil {
-		result.Error = fmt.Errorf("failed to build bundle: %w", err)
-		return result, result.Error
-	}
-
-	fmt.Printf("   Uploading bundle (2 items, %d bytes)...\n", len(bundleData))
-	bundleTXID, err := u.cfg.Gateway.UploadDataRaw(ctx, bundleData)
-	if err != nil {
-		result.Error = fmt.Errorf("bundle upload failed: %w", err)
-		return result, result.Error
-	}
-	fmt.Printf("   Bundle uploaded: %s\n", bundleTXID)
-
-	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, bundleTXID, 120, 3*time.Second)
-	if err != nil {
-		fmt.Printf("   Warning: bundle confirmation check failed: %v\n", err)
-	} else {
-		fmt.Printf("   Bundle confirmed at height=%d\n", status.BlockHeight)
-	}
-
-	return result, nil
-}
-
-// uploadCrossBundle handles the cross-bundle flow (reserved for future use).
-func (u *Uploader) uploadCrossBundle(ctx context.Context, result *UploadResult, carBytes []byte, cachePath string, arTags []arweave.Tag) (*UploadResult, error) {
-	carItem, err := arweave.SignBundleItem(carBytes, arTags, u.cfg.Wallet, nil)
-	if err != nil {
-		result.Error = fmt.Errorf("failed to sign CAR bundle item: %w", err)
-		return result, result.Error
-	}
-	carItemID := base64.RawURLEncoding.EncodeToString(carItem.ID)
-	result.DataTXID = carItemID
-
-	if !pow.NeedsPoW(result.DataSize) {
-		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
-	}
-
-	bundleData, err := buildSingleItemBundle(carItem)
-	if err != nil {
-		result.Error = fmt.Errorf("failed to build bundle: %w", err)
-		return result, result.Error
-	}
-	bundleTXID, err := u.cfg.Gateway.UploadDataRaw(ctx, bundleData)
-	if err != nil {
-		result.Error = fmt.Errorf("bundle upload failed: %w", err)
-		return result, result.Error
-	}
-	result.BundleTXID = bundleTXID
-	fmt.Printf("   CAR bundle uploaded: bundle_tx=%s, item=%s\n", bundleTXID, carItemID)
-
-	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, bundleTXID, 120, 3*time.Second)
-	if err != nil {
-		result.Error = fmt.Errorf("bundle confirmation failed: %w", err)
-		return result, result.Error
-	}
-	result.DataHeight = status.BlockHeight
-	fmt.Printf("   Bundle confirmed at height=%d\n", result.DataHeight)
-
-	if pow.NeedsPoW(result.DataSize) {
-		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
-			result.Error = err
-			return result, result.Error
-		}
-	}
-
-	if err := u.uploadMetadata(ctx, result); err != nil {
-		result.Error = err
-		return result, result.Error
-	}
-
-	return result, nil
-}
+/*
+// // uploadCrossBundle handles the cross-bundle flow (reserved for future use).
+// func (u *Uploader) uploadCrossBundle(ctx context.Context, result *UploadResult, carBytes []byte, cachePath string, arTags []arweave.Tag) (*UploadResult, error) {
+// 	carItem, err := arweave.SignBundleItem(carBytes, arTags, u.cfg.Wallet, nil)
+// 	if err != nil {
+// 		result.Error = fmt.Errorf("failed to sign CAR bundle item: %w", err)
+// 		return result, result.Error
+// 	}
+// 	carItemID := base64.RawURLEncoding.EncodeToString(carItem.ID)
+// 	result.DataTXID = carItemID
+// 
+// 	if !pow.NeedsPoW(result.DataSize) {
+// 		fmt.Printf("   File >= 100 MiB, skipping PoW\n")
+// 	}
+// 
+// 	bundleData, err := buildSingleItemBundle(carItem)
+// 	if err != nil {
+// 		result.Error = fmt.Errorf("failed to build bundle: %w", err)
+// 		return result, result.Error
+// 	}
+// 	bundleTXID, err := u.cfg.Gateway.UploadDataRaw(ctx, bundleData)
+// 	if err != nil {
+// 		result.Error = fmt.Errorf("bundle upload failed: %w", err)
+// 		return result, result.Error
+// 	}
+// 	result.BundleTXID = bundleTXID
+// 	fmt.Printf("   CAR bundle uploaded: bundle_tx=%s, item=%s\n", bundleTXID, carItemID)
+// 
+// 	status, err := u.cfg.Gateway.WaitForConfirmation(ctx, bundleTXID, 120, 3*time.Second)
+// 	if err != nil {
+// 		result.Error = fmt.Errorf("bundle confirmation failed: %w", err)
+// 		return result, result.Error
+// 	}
+// 	result.DataHeight = status.BlockHeight
+// 	fmt.Printf("   Bundle confirmed at height=%d\n", result.DataHeight)
+// 
+// 	if pow.NeedsPoW(result.DataSize) {
+// 		if err := u.computePoWSinglePass(ctx, result, cachePath); err != nil {
+// 			result.Error = err
+// 			return result, result.Error
+// 		}
+// 	}
+// 
+// 	if err := u.uploadMetadata(ctx, result); err != nil {
+// 		result.Error = err
+// 		return result, result.Error
+// 	}
+// 
+// 	return result, nil
+// }
+*/
 
 // uploadMetadata builds the metadata JSON and uploads it to Arweave (legacy).
 func (u *Uploader) uploadMetadata(ctx context.Context, result *UploadResult) error {
@@ -940,12 +954,14 @@ func reportPoWProgress(label string, workers int, info pow.ProgressInfo) {
 	}
 }
 
-// buildSingleItemBundle wraps a single BundleItem into a bundle binary.
-func buildSingleItemBundle(item *arweave.BundleItem) ([]byte, error) {
-	bb := arweave.NewBundleBuilder()
-	bb.AddItem(*item)
-	return bb.Build()
-}
+/*
+// // buildSingleItemBundle wraps a single BundleItem into a bundle binary.
+// func buildSingleItemBundle(item *arweave.BundleItem) ([]byte, error) {
+// 	bb := arweave.NewBundleBuilder()
+// 	bb.AddItem(*item)
+// 	return bb.Build()
+// }
+*/
 
 // UploadDir uploads all files in a directory.
 func (u *Uploader) UploadDir(ctx context.Context, dirPath string) ([]*UploadResult, error) {
@@ -1088,6 +1104,90 @@ func (u *Uploader) queryExistingCARsWithRetry(ctx context.Context, rootCID strin
 	}
 
 	fmt.Printf("   Warning: cannot query chain for dedup, continuing with fresh upload\n")
+	return nil
+}
+
+// =============================================================================
+// Metadata dedup
+// =============================================================================
+
+// dedupCheckMeta queries GraphQL for existing metadata transactions
+// matching the given rootCID + dataTXID. If found and valid, reuses
+// the existing transaction instead of uploading a duplicate.
+func (u *Uploader) dedupCheckMeta(ctx context.Context, result *UploadResult, state *UploadState) {
+	if !state.ShouldAttemptDedup() {
+		return
+	}
+
+	// Query metadata tx by Root-CID tag (and optionally Data-TXID)
+	metaCandidates := u.queryExistingMetaWithRetry(ctx, state.RootCID, state.CarTXID)
+	if len(metaCandidates) == 0 {
+		return
+	}
+
+	for _, txID := range metaCandidates {
+		fmt.Printf("   Found candidate metadata on chain: %s\n", txID)
+		debugLog("dedupCheckMeta: verifying candidate %s", txID)
+
+		// Verify: try to get and decode the raw metadata
+		metaVerified := u.verifyRemoteMetaWithFallback(ctx, txID, state.RootCID, state.CarTXID)
+		if metaVerified {
+			fmt.Printf("   Metadata verified, reusing existing transaction\n")
+			state.MetaTXID = txID
+			state.MetaConfirmed = true
+			// Get block height
+			if status, err := u.cfg.Gateway.GetTransactionStatus(ctx, txID); err == nil && status != nil {
+				state.MetaHeight = status.BlockHeight
+			}
+			if err := state.TransitionTo(StatusMetaConfirmed); err != nil {
+				state.Status = StatusMetaConfirmed
+			}
+			if saveErr := state.Save(); saveErr != nil {
+				fmt.Printf("   Warning: failed to save state: %v\n", saveErr)
+			}
+			return
+		}
+		fmt.Printf("   Warning: Candidate metadata %s verification failed\n", txID)
+	}
+
+	fmt.Printf("   Warning: %d existing metadata(s) found but all failed verification, uploading new metadata\n", len(metaCandidates))
+}
+
+// verifyRemoteMetaWithFallback wraps VerifyRemoteMeta with the primary gateway
+// (which VerifyRemoteMeta already has multi-gateway fallback for raw data).
+func (u *Uploader) verifyRemoteMetaWithFallback(ctx context.Context, txID, rootCID, dataTXID string) bool {
+	verified, err := VerifyRemoteMeta(ctx, u.cfg.Gateway, txID, rootCID, dataTXID)
+	if err != nil {
+		debugLog("verifyRemoteMetaWithFallback: %v", err)
+		return false
+	}
+	return verified
+}
+
+// queryExistingMetaWithRetry queries GraphQL for existing metadata
+// transactions matching the given rootCID and dataTXID. Retries up to 3
+// times with exponential backoff on network errors. Returns up to 5
+// candidate tx IDs (empty if none found).
+func (u *Uploader) queryExistingMetaWithRetry(ctx context.Context, rootCID, dataTXID string) []string {
+	maxRetries := 3
+	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+
+	for i := 0; i < maxRetries; i++ {
+		ids, err := u.cfg.Gateway.QueryExistingMetas(ctx, rootCID, dataTXID, 8)
+		if err == nil {
+			return ids
+		}
+		if i < maxRetries-1 {
+			fmt.Printf("   Warning: GraphQL metadata dedup check failed (attempt %d/%d): %v\n", i+1, maxRetries, err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(delays[i]):
+			}
+		}
+	}
+
+	fmt.Printf("   Warning: cannot query chain for metadata dedup, continuing with fresh upload\n")
 	return nil
 }
 

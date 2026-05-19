@@ -1,8 +1,9 @@
 module github.com/LWDJD/ipfar-uploader
 
-go 1.25.0
+go 1.25.3
 
 require (
+	github.com/LWDJD/ipfar-sdk v0.0.0
 	github.com/ipfs/go-cid v0.6.1
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/multiformats/go-varint v0.1.0
@@ -16,8 +17,9 @@ require (
 	github.com/multiformats/go-base32 v0.1.0 // indirect
 	github.com/multiformats/go-base36 v0.2.0 // indirect
 	github.com/multiformats/go-multibase v0.3.0 // indirect
-	github.com/shopspring/decimal v1.2.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
 )
+
+replace github.com/LWDJD/ipfar-sdk => ../ipfar-sdk
