@@ -31,7 +31,6 @@ import (
 	sdkmetadata "github.com/LWDJD/ipfar-sdk/verify/metadata"
 	"github.com/LWDJD/ipfar-sdk/verify/pipeline"
 
-	"github.com/LWDJD/ipfar-uploader/metadata"
 )
 
 const testInputFile = "/tmp/testfile.bin"
@@ -127,9 +126,9 @@ func TestIntegration_FullPipeline(t *testing.T) {
 	t.Logf("   Root CID: %s", rootCID.String())
 
 	// ── Step 3: 构建元数据 ──────────────────────────────────────
-	meta := &metadata.Metadata{
-		Version:      metadata.Version1,
-		Method:       metadata.MethodRaw,
+	meta := &sdkmetadata.Metadata{
+		Version:      sdkmetadata.Version1,
+		Method:       sdkmetadata.MethodRaw,
 		RootCID:      rootCID.String(),
 		DataTXID:     "mock_txid_" + rootCID.String()[:8] + "_123456789012345678901234567",
 		DataHeight:   1913000,
@@ -143,7 +142,7 @@ func TestIntegration_FullPipeline(t *testing.T) {
 		t.Fatalf("❌ Failed to serialize metadata: %v", err)
 	}
 
-	metaPath := filepath.Join(tmpDir, "metadata.json")
+	metaPath := filepath.Join(tmpDir, "sdkmetadata.json")
 	if err := os.WriteFile(metaPath, metaJSON, 0644); err != nil {
 		t.Fatalf("Failed to write metadata file: %v", err)
 	}
@@ -320,23 +319,23 @@ func TestIntegration_FullPipeline(t *testing.T) {
 	// ── 5h: Tags 格式验证 ──────────────────────────────────────
 	t.Log("\n🏷️  Tags 格式验证:")
 
-	carTags := metadata.BuildCARTags(rootCID.String(), originalSize)
+	carTags := sdkmetadata.BuildCARTags(rootCID.String(), originalSize)
 	t.Log("   CAR Tags:")
 	for _, tag := range carTags {
 		t.Logf("      %s: %s", tag.Name, tag.Value)
 	}
-	if err := sdkmetadata.ValidateTags(convertTags(carTags)); err != nil {
+	if err := sdkmetadata.ValidateTags(carTags); err != nil {
 		t.Errorf("❌ CAR Tags 验证失败: %v", err)
 	} else {
 		t.Log("✅ CAR Tags 符合 IPFAR 规范")
 	}
 
-	metaTags := metadata.BuildMetaTags(rootCID.String(), meta.DataTXID)
+	metaTags := sdkmetadata.BuildMetaTags(rootCID.String(), meta.DataTXID)
 	t.Log("   Meta Tags:")
 	for _, tag := range metaTags {
 		t.Logf("      %s: %s", tag.Name, tag.Value)
 	}
-	if err := sdkmetadata.ValidateTags(convertTags(metaTags)); err != nil {
+	if err := sdkmetadata.ValidateTags(metaTags); err != nil {
 		t.Errorf("❌ Meta Tags 验证失败: %v", err)
 	} else {
 		t.Log("✅ Meta Tags 符合 IPFAR 规范")
@@ -479,9 +478,9 @@ func TestIntegration_CARv2_SelfConsistency(t *testing.T) {
 }
 
 func TestIntegration_MetadataRoundTrip(t *testing.T) {
-	meta := &metadata.Metadata{
-		Version:      metadata.Version1,
-		Method:       metadata.MethodRaw,
+	meta := &sdkmetadata.Metadata{
+		Version:      sdkmetadata.Version1,
+		Method:       sdkmetadata.MethodRaw,
 		RootCID:      "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
 		DataTXID:     "test_txid_1234567890123456789012345678901234567890",
 		DataHeight:   1913000,
@@ -536,14 +535,6 @@ func TestIntegration_MetadataRoundTrip(t *testing.T) {
 // ============================================================================
 // 辅助
 // ============================================================================
-
-func convertTags(tags []metadata.Tag) []sdkmetadata.Tag {
-	result := make([]sdkmetadata.Tag, len(tags))
-	for i, t := range tags {
-		result[i] = sdkmetadata.Tag{Name: t.Name, Value: t.Value}
-	}
-	return result
-}
 
 func init() {
 	fmt.Println(`

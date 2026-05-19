@@ -3,7 +3,6 @@ package uploader
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,10 +10,10 @@ import (
 	"time"
 
 	"github.com/LWDJD/ipfar-uploader/arweave"
-	"github.com/LWDJD/ipfar-uploader/metadata"
 
 	"github.com/LWDJD/ipfar-sdk/ipfar"
 	sdkpow "github.com/LWDJD/ipfar-sdk/pow"
+	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
 )
 
 // Config holds uploader configuration.
@@ -99,9 +98,9 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 	result.RootCID = rootCID.String()
 
 	// Determine method
-	method := metadata.MethodRaw
+	method := sdkmeta.MethodRaw
 	if u.cfg.UseBundle {
-		method = metadata.MethodBundle
+		method = sdkmeta.MethodBundle
 	}
 	result.Method = method
 
@@ -197,13 +196,13 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 // Supports: raw, bundle, and chunked flows.
 func (u *Uploader) uploadCarWithState(ctx context.Context, result *UploadResult, carBytes []byte, state *UploadState) error {
 	cachePath := state.FilePath + ".pow.json"
-	carTags := metadata.BuildCARTags(result.RootCID, result.DataSize)
+	carTags := sdkmeta.BuildCARTags(result.RootCID, result.DataSize)
 	arTags := toArweaveTags(carTags)
 
 	switch state.Method {
-	case metadata.MethodRaw:
+	case sdkmeta.MethodRaw:
 		return u.uploadCarRaw(ctx, result, carBytes, state, cachePath, arTags)
-	case metadata.MethodBundle:
+	case sdkmeta.MethodBundle:
 		// TODO(phase-5): re-enable bundle upload once SDK bundle support is ready.
 		return fmt.Errorf("bundle upload not yet implemented (phase 5)")
 	default:
@@ -352,8 +351,8 @@ func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult
 // 	result.BundleTXID = "none"
 // 
 // 	meta := &metadata.Metadata{
-// 		Version:      metadata.Version1,
-// 		Method:       metadata.MethodBundle,
+// 		Version:      sdkmeta.Version1,
+// 		Method:       sdkmeta.MethodBundle,
 // 		RootCID:      result.RootCID,
 // 		DataTXID:     result.DataTXID,
 // 		BundleTXID:   result.BundleTXID,
@@ -376,7 +375,7 @@ func (u *Uploader) uploadCarRawChunked(ctx context.Context, result *UploadResult
 // 	metaBase64 := base64.RawURLEncoding.EncodeToString(metaJSON)
 // 
 // 	// Sign metadata as a bundle item
-// 	metaTags := metadata.BuildMetaTags(result.RootCID, result.DataTXID)
+// 	metaTags := sdkmeta.BuildMetaTags(result.RootCID, result.DataTXID)
 // 	metaArTags := toArweaveTags(metaTags)
 // 	metaItem, err := arweave.SignBundleItem([]byte(metaBase64), metaArTags, u.cfg.Wallet, nil)
 // 	if err != nil {
@@ -474,41 +473,34 @@ func (u *Uploader) uploadMetaWithState(ctx context.Context, result *UploadResult
 		return nil
 	}
 
-	meta := &metadata.Metadata{
-		Version:      metadata.Version1,
+	opts := &sdkmeta.MetaOptions{
 		Method:       state.Method,
-		RootCID:      state.RootCID,
-		DataTXID:     state.CarTXID,
-		BundleTXID:   state.BundleTXID,
-		DataHeight:   state.CarHeight,
-		DataSize:     int(state.DataSize),
 		ContentType:  result.ContentType,
 		OriginalName: result.OriginalName,
+		BundleTXID:   state.BundleTXID,
 	}
 	if sdkpow.NeedsPoW(result.DataSize) {
-		meta.PoW = result.PoW
-		meta.PoWAlg = sdkpow.Algorithm
+		opts.PoW = result.PoW
+		opts.PoWAlg = sdkpow.Algorithm
 	}
 
-	metaJSON, err := meta.ToJSON()
+	metaJSON, err := sdkmeta.BuildMetaJSON(state.RootCID, state.CarTXID, state.DataSize, state.CarHeight, opts)
 	if err != nil {
-		state.SetError(fmt.Errorf("failed to serialize metadata: %w", err))
+		state.SetError(fmt.Errorf("failed to build metadata JSON: %w", err))
 		state.Save()
 		return stateError(state)
 	}
-	metaBase64 := base64.RawURLEncoding.EncodeToString(metaJSON)
 
-	metaTags := metadata.BuildMetaTags(state.RootCID, state.CarTXID)
+	metaTags := sdkmeta.BuildMetaTags(state.RootCID, state.CarTXID)
 
 	// Transition to uploading
 	state.TransitionTo(StatusMetaUploading)
 	state.Save()
 
-	// Upload via chunked path (goar) — uses SHA-384 deep hash and
-	// base64url-encoded tags required by Arweave mainnet gateways.
+	// Upload raw JSON (not base64-encoded) via chunked path (goar).
 	fmt.Printf("   Uploading metadata...\n")
 	debugLog("uploadMetaWithState: metaJSON preview=%.100s", string(metaJSON))
-	metaTX, metaStatus, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, []byte(metaBase64), toArweaveTags(metaTags))
+	metaTX, metaStatus, err := u.cfg.Gateway.UploadDataChunked(ctx, u.cfg.Wallet, metaJSON, toArweaveTags(metaTags))
 	if err != nil {
 		// Check whether the transaction was submitted successfully but
 		// WaitForConfirmation timed out.  In that case metaTX carries a
@@ -781,8 +773,8 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 // 	result.BundleTXID = "none"
 // 
 // 	meta := &metadata.Metadata{
-// 		Version:      metadata.Version1,
-// 		Method:       metadata.MethodBundle,
+// 		Version:      sdkmeta.Version1,
+// 		Method:       sdkmeta.MethodBundle,
 // 		RootCID:      result.RootCID,
 // 		DataTXID:     result.DataTXID,
 // 		BundleTXID:   result.BundleTXID,
@@ -803,7 +795,7 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 // 	}
 // 	metaBase64 := base64.RawURLEncoding.EncodeToString(metaJSON)
 // 
-// 	metaTags := metadata.BuildMetaTags(result.RootCID, result.DataTXID)
+// 	metaTags := sdkmeta.BuildMetaTags(result.RootCID, result.DataTXID)
 // 	metaArTags := toArweaveTags(metaTags)
 // 	metaItem, err := arweave.SignBundleItem([]byte(metaBase64), metaArTags, u.cfg.Wallet, nil)
 // 	if err != nil {
@@ -896,31 +888,25 @@ func (u *Uploader) uploadRaw(ctx context.Context, result *UploadResult, carBytes
 
 // uploadMetadata builds the metadata JSON and uploads it to Arweave (legacy).
 func (u *Uploader) uploadMetadata(ctx context.Context, result *UploadResult) error {
-	meta := &metadata.Metadata{
-		Version:      metadata.Version1,
+	opts := &sdkmeta.MetaOptions{
 		Method:       result.Method,
-		RootCID:      result.RootCID,
-		DataTXID:     result.DataTXID,
-		BundleTXID:   result.BundleTXID,
-		DataHeight:   result.DataHeight,
-		DataSize:     int(result.DataSize),
 		ContentType:  result.ContentType,
 		OriginalName: result.OriginalName,
+		BundleTXID:   result.BundleTXID,
 	}
 	if sdkpow.NeedsPoW(result.DataSize) {
-		meta.PoW = result.PoW
-		meta.PoWAlg = sdkpow.Algorithm
+		opts.PoW = result.PoW
+		opts.PoWAlg = sdkpow.Algorithm
 	}
 
-	metaJSON, err := meta.ToJSON()
+	metaJSON, err := sdkmeta.BuildMetaJSON(result.RootCID, result.DataTXID, result.DataSize, result.DataHeight, opts)
 	if err != nil {
-		return fmt.Errorf("failed to serialize metadata: %w", err)
+		return fmt.Errorf("failed to build metadata JSON: %w", err)
 	}
-	metaBase64 := base64.RawURLEncoding.EncodeToString(metaJSON)
 
-	metaTags := metadata.BuildMetaTags(result.RootCID, result.DataTXID)
+	metaTags := sdkmeta.BuildMetaTags(result.RootCID, result.DataTXID)
 	fmt.Printf("   Uploading metadata...\n")
-	metaTX, _, err := u.cfg.Gateway.UploadData(ctx, u.cfg.Wallet, []byte(metaBase64), toArweaveTags(metaTags))
+	metaTX, _, err := u.cfg.Gateway.UploadData(ctx, u.cfg.Wallet, metaJSON, toArweaveTags(metaTags))
 	if err != nil {
 		return fmt.Errorf("metadata upload failed: %w", err)
 	}
@@ -1027,7 +1013,7 @@ func detectContentType(path string) string {
 	return "application/octet-stream"
 }
 
-func toArweaveTags(tags []metadata.Tag) []arweave.Tag {
+func toArweaveTags(tags []sdkmeta.Tag) []arweave.Tag {
 	result := make([]arweave.Tag, len(tags))
 	for i, t := range tags {
 		result[i] = arweave.Tag{Name: t.Name, Value: t.Value}

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LWDJD/ipfar-uploader/metadata"
+	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
 )
 
 // =============================================================================
@@ -87,7 +87,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	tmpDir := t.TempDir()
 	filePath := filepath.Join(tmpDir, "test.bin")
 
-	original := NewUploadState(filePath, "bafyTestCID", "abc123hash", 1024, metadata.MethodRaw)
+	original := NewUploadState(filePath, "bafyTestCID", "abc123hash", 1024, sdkmeta.MethodRaw)
 	original.Status = StatusCarSubmitted
 	original.CarTXID = "test-txid-123"
 	original.CarSubmittedAt = TimeNow()
@@ -158,7 +158,7 @@ func TestAtomicSave(t *testing.T) {
 	tmpDir := t.TempDir()
 	filePath := filepath.Join(tmpDir, "test.bin")
 
-	s := NewUploadState(filePath, "bafyCID", "hash", 100, metadata.MethodRaw)
+	s := NewUploadState(filePath, "bafyCID", "hash", 100, sdkmeta.MethodRaw)
 	if err := s.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestStateFilePath(t *testing.T) {
 // =============================================================================
 
 func TestNewUploadState(t *testing.T) {
-	s := NewUploadState("file.bin", "bafyCID", "hash123", 2048, metadata.MethodRaw)
+	s := NewUploadState("file.bin", "bafyCID", "hash123", 2048, sdkmeta.MethodRaw)
 
 	if s.FilePath != "file.bin" {
 		t.Errorf("FilePath: got %q", s.FilePath)
@@ -408,7 +408,7 @@ func TestNewUploadState(t *testing.T) {
 	if s.DataSize != 2048 {
 		t.Errorf("DataSize: got %d", s.DataSize)
 	}
-	if s.Method != metadata.MethodRaw {
+	if s.Method != sdkmeta.MethodRaw {
 		t.Errorf("Method: got %q", s.Method)
 	}
 	if s.IsComplete() {
