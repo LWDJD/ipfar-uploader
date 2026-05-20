@@ -119,7 +119,7 @@ func (u *Uploader) UploadFile(ctx context.Context, filePath string) (*UploadResu
 	}
 
 	// ── 6. Call SDK to upload ────────────────────────────────────────
-	fmt.Printf("   Uploading %s (%d bytes)...\n", originalName, dataSize)
+	fmt.Printf("   Processing %s (%d bytes)...\n", originalName, dataSize)
 	state.TransitionTo(StatusUploading)
 	state.Save()
 
