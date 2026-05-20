@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	sdkmeta "github.com/LWDJD/ipfar-sdk/verify/metadata"
 )
@@ -18,12 +17,7 @@ func TestStateTransition_ValidFlow(t *testing.T) {
 	s := &UploadState{Status: StatusPending}
 
 	steps := []UploadStatus{
-		StatusCarUploading,
-		StatusCarSubmitted,
-		StatusCarConfirmed,
-		StatusMetaUploading,
-		StatusMetaSubmitted,
-		StatusMetaConfirmed,
+		StatusUploading,
 		StatusDone,
 	}
 
@@ -39,11 +33,9 @@ func TestStateTransition_InvalidJumps(t *testing.T) {
 		from UploadStatus
 		to   UploadStatus
 	}{
-		{StatusPending, StatusCarConfirmed},   // skip car_submitted
-		{StatusPending, StatusDone},           // skip all
-		{StatusCarSubmitted, StatusDone},      // skip meta (needs car_confirmed first)
-		{StatusDone, StatusPending},           // can't restart
-		{StatusMetaConfirmed, StatusPending},  // can't go back
+		{StatusPending, StatusDone},          // skip uploading
+		{StatusDone, StatusPending},          // can't go back
+		{StatusDone, StatusUploading},        // can't restart
 	}
 
 	for _, tt := range tests {
@@ -55,27 +47,28 @@ func TestStateTransition_InvalidJumps(t *testing.T) {
 	}
 }
 
-func TestStateTransition_BundleFlow(t *testing.T) {
-	// Bundle flow: car_submitted → car_confirmed → done
-	// (meta is bundled with car, so car_confirmed implies meta_confirmed)
+func TestStateTransition_RetryFlow(t *testing.T) {
+	// Retry: uploading → pending → uploading → done
 	s := &UploadState{Status: StatusPending}
 
-	if err := s.TransitionTo(StatusCarUploading); err != nil {
+	if err := s.TransitionTo(StatusUploading); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.TransitionTo(StatusCarSubmitted); err != nil {
+	// Can go back to pending for retry
+	if err := s.TransitionTo(StatusPending); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.TransitionTo(StatusCarConfirmed); err != nil {
+	// Then uploading again
+	if err := s.TransitionTo(StatusUploading); err != nil {
 		t.Fatal(err)
 	}
-	// For bundle, after car_confirmed, we set both confirm flags and go to done
-	s.CarConfirmed = true
-	s.MetaConfirmed = true
-	s.Status = StatusDone
+	// Then done
+	if err := s.TransitionTo(StatusDone); err != nil {
+		t.Fatal(err)
+	}
 
 	if !s.IsComplete() {
-		t.Error("bundle flow should be complete after car_confirmed + meta_confirmed")
+		t.Error("should be complete after done")
 	}
 }
 
@@ -88,9 +81,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	filePath := filepath.Join(tmpDir, "test.bin")
 
 	original := NewUploadState(filePath, "bafyTestCID", "abc123hash", 1024, sdkmeta.MethodRaw)
-	original.Status = StatusCarSubmitted
+	original.Status = StatusUploading
 	original.CarTXID = "test-txid-123"
-	original.CarSubmittedAt = TimeNow()
 
 	if err := original.Save(); err != nil {
 		t.Fatalf("Save failed: %v", err)
@@ -181,144 +173,93 @@ func TestAtomicSave(t *testing.T) {
 	}
 }
 
+func TestLoadState_MigratesLegacyStatus(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "legacy.bin")
+	statePath := stateFilePath(filePath)
+
+	// Write a state with legacy status "car_confirmed"
+	legacy := map[string]interface{}{
+		"file_path":     filePath,
+		"file_hash":     "abc123",
+		"root_cid":      "bafyLegacy",
+		"data_size":     1024,
+		"status":        "car_confirmed",
+		"car_txid":      "old-txid",
+		"car_confirmed": true,
+		"car_height":    100,
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := LoadState(filePath)
+	if err != nil {
+		t.Fatalf("LoadState failed: %v", err)
+	}
+	if s == nil {
+		t.Fatal("expected non-nil state")
+	}
+	if s.Status != StatusPending {
+		t.Errorf("legacy status should be migrated to pending, got %q", s.Status)
+	}
+	// Old txid should be preserved
+	if s.CarTXID != "old-txid" {
+		t.Errorf("CarTXID should be preserved: got %q, want 'old-txid'", s.CarTXID)
+	}
+}
+
 // =============================================================================
-// Dedup / Resume query tests
+// Query tests
 // =============================================================================
 
 func TestIsComplete(t *testing.T) {
 	tests := []struct {
-		car  bool
-		meta bool
-		want bool
+		status UploadStatus
+		want   bool
 	}{
-		{false, false, false},
-		{true, false, false},
-		{false, true, false},
-		{true, true, true},
+		{StatusPending, false},
+		{StatusUploading, false},
+		{StatusDone, true},
 	}
 	for _, tt := range tests {
-		s := &UploadState{CarConfirmed: tt.car, MetaConfirmed: tt.meta}
+		s := &UploadState{Status: tt.status}
 		if got := s.IsComplete(); got != tt.want {
-			t.Errorf("IsComplete(car=%v, meta=%v) = %v, want %v", tt.car, tt.meta, got, tt.want)
+			t.Errorf("IsComplete(status=%s) = %v, want %v", tt.status, got, tt.want)
 		}
 	}
 }
 
 func TestNeedsCARUpload(t *testing.T) {
-	s := &UploadState{CarConfirmed: false}
+	s := &UploadState{Status: StatusPending}
 	if !s.NeedsCARUpload() {
-		t.Error("should need CAR upload when not confirmed")
+		t.Error("should need CAR upload when pending")
 	}
-	s.CarConfirmed = true
+	s.Status = StatusUploading
 	if s.NeedsCARUpload() {
-		t.Error("should NOT need CAR upload when confirmed")
+		t.Error("should NOT need CAR upload when uploading")
+	}
+	s.Status = StatusDone
+	if s.NeedsCARUpload() {
+		t.Error("should NOT need CAR upload when done")
 	}
 }
 
 func TestNeedsMetaUpload(t *testing.T) {
-	s := &UploadState{CarConfirmed: false, MetaConfirmed: false}
+	// With simplified pipeline, metadata is handled together with CAR.
+	// NeedsMetaUpload always returns false.
+	s := &UploadState{Status: StatusPending}
 	if s.NeedsMetaUpload() {
-		t.Error("should NOT need meta upload when CAR not confirmed")
+		t.Error("should NOT need separate meta upload")
 	}
-	s.CarConfirmed = true
-	if !s.NeedsMetaUpload() {
-		t.Error("should need meta upload when CAR confirmed but meta not")
-	}
-	s.MetaConfirmed = true
+	s.Status = StatusDone
 	if s.NeedsMetaUpload() {
-		t.Error("should NOT need meta upload when both confirmed")
+		t.Error("should NOT need separate meta upload when done")
 	}
-}
-
-func TestCanResubmitCAR(t *testing.T) {
-	t.Run("never submitted", func(t *testing.T) {
-		s := &UploadState{CarConfirmed: false, RetryCount: 0}
-		if !s.CanResubmitCAR() {
-			t.Error("should allow resubmit when never submitted")
-		}
-	})
-
-	t.Run("submitted recently", func(t *testing.T) {
-		s := &UploadState{
-			CarConfirmed:   false,
-			CarSubmittedAt: time.Now().Format(time.RFC3339Nano),
-			RetryCount:     0,
-		}
-		if s.CanResubmitCAR() {
-			t.Error("should NOT allow resubmit when just submitted")
-		}
-	})
-
-	t.Run("submitted long ago", func(t *testing.T) {
-		s := &UploadState{
-			CarConfirmed:   false,
-			CarSubmittedAt: time.Now().Add(-1 * time.Hour).Format(time.RFC3339Nano),
-			RetryCount:     0,
-		}
-		if !s.CanResubmitCAR() {
-			t.Error("should allow resubmit after timeout")
-		}
-	})
-
-	t.Run("max retries exceeded", func(t *testing.T) {
-		s := &UploadState{
-			CarConfirmed:   false,
-			CarSubmittedAt: time.Now().Add(-1 * time.Hour).Format(time.RFC3339Nano),
-			RetryCount:     maxRetries,
-		}
-		if s.CanResubmitCAR() {
-			t.Error("should NOT allow resubmit when retries exhausted")
-		}
-	})
-
-	t.Run("already confirmed", func(t *testing.T) {
-		s := &UploadState{
-			CarConfirmed:   true,
-			CarSubmittedAt: time.Now().Add(-1 * time.Hour).Format(time.RFC3339Nano),
-			RetryCount:     0,
-		}
-		if s.CanResubmitCAR() {
-			t.Error("should NOT allow resubmit when already confirmed")
-		}
-	})
-}
-
-func TestShouldWaitForCAR(t *testing.T) {
-	t.Run("recently submitted", func(t *testing.T) {
-		s := &UploadState{
-			CarConfirmed:   false,
-			CarTXID:        "test-txid",
-			CarSubmittedAt: time.Now().Format(time.RFC3339Nano),
-			RetryCount:     0,
-		}
-		if !s.ShouldWaitForCAR() {
-			t.Error("should wait when recently submitted")
-		}
-	})
-
-	t.Run("no txid", func(t *testing.T) {
-		s := &UploadState{
-			CarConfirmed:   false,
-			CarTXID:        "",
-			CarSubmittedAt: time.Now().Format(time.RFC3339Nano),
-			RetryCount:     0,
-		}
-		if s.ShouldWaitForCAR() {
-			t.Error("should NOT wait when no txid")
-		}
-	})
-
-	t.Run("already confirmed", func(t *testing.T) {
-		s := &UploadState{
-			CarConfirmed:   true,
-			CarTXID:        "test-txid",
-			CarSubmittedAt: time.Now().Format(time.RFC3339Nano),
-			RetryCount:     0,
-		}
-		if s.ShouldWaitForCAR() {
-			t.Error("should NOT wait when already confirmed")
-		}
-	})
 }
 
 // =============================================================================
@@ -361,6 +302,20 @@ func TestComputeFileHash(t *testing.T) {
 	}
 	if hash1 == hash3 {
 		t.Error("different files should have different hashes")
+	}
+}
+
+func TestComputeFileHash_InMemory(t *testing.T) {
+	data := []byte("in-memory hash test")
+	h := computeFileHash(data)
+	if len(h) != 64 {
+		t.Errorf("expected 64-char hex hash, got %d chars: %s", len(h), h)
+	}
+
+	// Deterministic
+	h2 := computeFileHash(data)
+	if h != h2 {
+		t.Error("hash should be deterministic")
 	}
 }
 
@@ -425,24 +380,17 @@ func TestNewUploadState(t *testing.T) {
 
 func TestShouldAttemptDedup(t *testing.T) {
 	tests := []struct {
-		name   string
-		status UploadStatus
+		name    string
+		status  UploadStatus
 		carTXID string
-		want   bool
+		want    bool
 	}{
 		{"pending with empty txid", StatusPending, "", true},
-		{"pending with txid (shouldn't happen)", StatusPending, "tx123", true},
-		{"car_uploading with empty txid", StatusCarUploading, "", true},
-		{"car_uploading with txid (shouldn't happen)", StatusCarUploading, "tx123", true},
-		{"car_submitted with empty txid", StatusCarSubmitted, "", true},
-		{"car_submitted with txid", StatusCarSubmitted, "tx123", false},
-		{"car_confirmed with empty txid", StatusCarConfirmed, "", true},
-		{"car_confirmed with txid", StatusCarConfirmed, "tx123", false},
-		{"meta_uploading with txid", StatusMetaUploading, "tx123", false},
-		{"meta_submitted with txid", StatusMetaSubmitted, "tx123", false},
-		{"meta_confirmed with txid", StatusMetaConfirmed, "tx123", false},
+		{"pending with txid", StatusPending, "tx123", true},
+		{"uploading with empty txid", StatusUploading, "", true},
+		{"uploading with txid", StatusUploading, "tx123", false},
+		{"done with empty txid", StatusDone, "", false},
 		{"done with txid", StatusDone, "tx123", false},
-		{"done with empty txid", StatusDone, "", true},
 	}
 
 	for _, tt := range tests {
@@ -479,3 +427,49 @@ func timeoutError() error {
 type testError struct{ msg string }
 
 func (e *testError) Error() string { return e.msg }
+
+// =============================================================================
+// resultFromState tests
+// =============================================================================
+
+func TestResultFromState(t *testing.T) {
+	state := &UploadState{
+		FilePath:   "/tmp/test.bin",
+		RootCID:    "bafyTest",
+		DataSize:   2048,
+		CarTXID:    "car-tx-123",
+		MetaTXID:   "meta-tx-456",
+		CarHeight:  100,
+		BundleTXID: "bundle-tx-789",
+	}
+
+	result := resultFromState(state, "/tmp/test.bin", "test.bin", "image/png", "raw")
+
+	if result.FilePath != "/tmp/test.bin" {
+		t.Errorf("FilePath: got %q", result.FilePath)
+	}
+	if result.RootCID != "bafyTest" {
+		t.Errorf("RootCID: got %q", result.RootCID)
+	}
+	if result.DataTXID != "car-tx-123" {
+		t.Errorf("DataTXID: got %q", result.DataTXID)
+	}
+	if result.MetaTXID != "meta-tx-456" {
+		t.Errorf("MetaTXID: got %q", result.MetaTXID)
+	}
+	if result.BundleTXID != "bundle-tx-789" {
+		t.Errorf("BundleTXID: got %q", result.BundleTXID)
+	}
+	if result.OriginalName != "test.bin" {
+		t.Errorf("OriginalName: got %q", result.OriginalName)
+	}
+	if result.ContentType != "image/png" {
+		t.Errorf("ContentType: got %q", result.ContentType)
+	}
+	if result.Method != "raw" {
+		t.Errorf("Method: got %q", result.Method)
+	}
+	if result.Error != nil {
+		t.Errorf("Error should be nil, got %v", result.Error)
+	}
+}

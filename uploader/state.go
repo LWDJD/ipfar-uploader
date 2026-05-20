@@ -17,36 +17,17 @@ import (
 type UploadStatus string
 
 const (
-	StatusPending       UploadStatus = "pending"
-	StatusCarUploading  UploadStatus = "car_uploading"
-	StatusCarSubmitted  UploadStatus = "car_submitted"
-	StatusCarConfirmed  UploadStatus = "car_confirmed"
-	StatusMetaUploading UploadStatus = "meta_uploading"
-	StatusMetaSubmitted UploadStatus = "meta_submitted"
-	StatusMetaConfirmed UploadStatus = "meta_confirmed"
-	StatusDone          UploadStatus = "done"
+	StatusPending   UploadStatus = "pending"
+	StatusUploading UploadStatus = "uploading" // SDK handles the full upload pipeline
+	StatusDone      UploadStatus = "done"
 )
 
 // validTransitions defines allowed status transitions.
 var validTransitions = map[UploadStatus][]UploadStatus{
-	StatusPending:       {StatusCarUploading},
-	StatusCarUploading:  {StatusCarSubmitted, StatusPending},
-	StatusCarSubmitted:  {StatusCarConfirmed, StatusCarUploading, StatusPending},
-	StatusCarConfirmed:  {StatusMetaUploading, StatusDone}, // StatusDone for bundle (meta bundled with car)
-	StatusMetaUploading: {StatusMetaSubmitted, StatusCarConfirmed},
-	StatusMetaSubmitted: {StatusMetaConfirmed, StatusMetaUploading},
-	StatusMetaConfirmed: {StatusDone},
-	StatusDone:          {},
+	StatusPending:   {StatusUploading},
+	StatusUploading: {StatusDone, StatusPending}, // retry resets to pending
+	StatusDone:      {},
 }
-
-// =============================================================================
-// Constants
-// =============================================================================
-
-const (
-	maxRetries      = 3
-	resubmitTimeout = 30 * time.Minute
-)
 
 // =============================================================================
 // State struct
@@ -55,23 +36,19 @@ const (
 // UploadState tracks the progress of a single file upload to Arweave.
 // It is persisted as {filePath}.upload.json alongside the source file.
 type UploadState struct {
-	FilePath        string       `json:"file_path"`
-	FileHash        string       `json:"file_hash"`
-	RootCID         string       `json:"root_cid"`
-	DataSize        int64        `json:"data_size"`
-	Status          UploadStatus `json:"status"`
-	Method          string       `json:"method,omitempty"`
-	CarTXID         string       `json:"car_txid"`
-	CarSubmittedAt  string       `json:"car_submitted_at"`
-	CarConfirmed    bool         `json:"car_confirmed"`
-	CarHeight       int          `json:"car_height"`
-	MetaTXID        string       `json:"meta_txid"`
-	MetaSubmittedAt string       `json:"meta_submitted_at"`
-	MetaConfirmed   bool         `json:"meta_confirmed"`
-	MetaHeight      int          `json:"meta_height"`
-	BundleTXID      string       `json:"bundle_txid,omitempty"`
-	RetryCount      int          `json:"retry_count"`
-	LastError       string       `json:"last_error"`
+	FilePath   string       `json:"file_path"`
+	FileHash   string       `json:"file_hash"`
+	RootCID    string       `json:"root_cid"`
+	DataSize   int64        `json:"data_size"`
+	Status     UploadStatus `json:"status"`
+	Method     string       `json:"method,omitempty"`
+	CarTXID    string       `json:"car_txid"`
+	CarHeight  int          `json:"car_height"`
+	MetaTXID   string       `json:"meta_txid"`
+	MetaHeight int          `json:"meta_height"`
+	BundleTXID string       `json:"bundle_txid,omitempty"`
+	RetryCount int          `json:"retry_count"`
+	LastError  string       `json:"last_error"`
 }
 
 // =============================================================================
@@ -105,16 +82,27 @@ func LoadState(filePath string) (*UploadState, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("failed to parse state file %s: %w", sp, err)
 	}
-	debugLog("LoadState: status=%s, carTXID=%s, carConfirmed=%v, metaTXID=%s, metaConfirmed=%v",
-		s.Status, s.CarTXID, s.CarConfirmed, s.MetaTXID, s.MetaConfirmed)
+
+	// Migrate legacy statuses to simplified model.
+	switch s.Status {
+	case StatusPending, StatusUploading, StatusDone:
+		// valid
+	default:
+		// Old intermediate status — reset to pending so the SDK retries.
+		debugLog("LoadState: migrating legacy status %q -> pending", s.Status)
+		s.Status = StatusPending
+	}
+
+	debugLog("LoadState: status=%s, carTXID=%s, metaTXID=%s",
+		s.Status, s.CarTXID, s.MetaTXID)
 	return &s, nil
 }
 
 // Save atomically writes the upload state to disk (temp file + rename).
 func (s *UploadState) Save() error {
 	sp := stateFilePath(s.FilePath)
-	debugLog("Save: writing %s, status=%s, carTXID=%s, carConfirmed=%v, retryCount=%d",
-		sp, s.Status, s.CarTXID, s.CarConfirmed, s.RetryCount)
+	debugLog("Save: writing %s, status=%s, carTXID=%s, retryCount=%d",
+		sp, s.Status, s.CarTXID, s.RetryCount)
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal state: %w", err)
@@ -164,121 +152,34 @@ func (s *UploadState) SetError(err error) {
 // Query helpers
 // =============================================================================
 
-// IsComplete returns true when both CAR and metadata are confirmed.
+// IsComplete returns true when the upload has finished successfully.
 func (s *UploadState) IsComplete() bool {
-	return s.CarConfirmed && s.MetaConfirmed
+	return s.Status == StatusDone
 }
 
-// NeedsCARUpload returns true if the CAR has not been confirmed yet.
+// NeedsCARUpload returns true if the CAR has not been uploaded yet.
+// With the simplified pipeline, this means the SDK hasn't started.
 func (s *UploadState) NeedsCARUpload() bool {
-	return !s.CarConfirmed
+	return s.Status == StatusPending
 }
 
-// NeedsMetaUpload returns true if CAR is confirmed but metadata has not been
-// submitted yet.  If a metadata tx was already submitted (MetaTXID non-empty)
-// but not yet confirmed, this returns false — the uploader should wait for
-// confirmation instead of re-uploading (see NeedsMetaConfirmation).
+// NeedsMetaUpload always returns false — the SDK handles metadata
+// together with the CAR in a single pass.
 func (s *UploadState) NeedsMetaUpload() bool {
-	return s.CarConfirmed && !s.MetaConfirmed && s.MetaTXID == ""
+	return false
 }
 
-// NeedsMetaConfirmation returns true when metadata was submitted (MetaTXID is
-// set) but has not yet been confirmed on chain.  The uploader should poll
-// GET /tx/{id} to check whether the transaction has been mined.
-func (s *UploadState) NeedsMetaConfirmation() bool {
-	return s.CarConfirmed && s.MetaTXID != "" && !s.MetaConfirmed
-}
-
-// CanResubmitCAR returns true when:
-//   - CAR is not yet confirmed
-//   - retry budget remains
-//   - the previous submission timed out (>30 min) OR was never submitted
-func (s *UploadState) CanResubmitCAR() bool {
-	if s.CarConfirmed {
-		return false
-	}
-	if s.RetryCount >= maxRetries {
-		return false
-	}
-	if s.CarSubmittedAt == "" {
+// ShouldAttemptDedup returns true when the uploader should query GraphQL
+// to check for an existing transaction on chain.
+//
+// With the simplified pipeline, dedup is handled by the SDK internally.
+// This method remains for callers that want to pre-check before invoking
+// the SDK.
+func (s *UploadState) ShouldAttemptDedup() bool {
+	if s.Status == StatusPending {
 		return true
 	}
-	t, err := time.Parse(time.RFC3339Nano, s.CarSubmittedAt)
-	if err != nil {
-		// Fallback: try a few common layouts
-		for _, layout := range []string{
-			time.RFC3339,
-			"2006-01-02T15:04:05Z07:00",
-			"2006-01-02T15:04:05-07:00",
-		} {
-			if t, err = time.Parse(layout, s.CarSubmittedAt); err == nil {
-				break
-			}
-		}
-		if err != nil {
-			return true // can't parse, assume stale
-		}
-	}
-	return time.Since(t) > resubmitTimeout
-}
-
-// CanResubmitMeta returns true when metadata tx can be resubmitted.
-func (s *UploadState) CanResubmitMeta() bool {
-	if s.MetaConfirmed {
-		return false
-	}
-	if s.RetryCount >= maxRetries {
-		return false
-	}
-	if s.MetaSubmittedAt == "" {
-		return true
-	}
-	t, err := time.Parse(time.RFC3339Nano, s.MetaSubmittedAt)
-	if err != nil {
-		for _, layout := range []string{
-			time.RFC3339,
-			"2006-01-02T15:04:05Z07:00",
-			"2006-01-02T15:04:05-07:00",
-		} {
-			if t, err = time.Parse(layout, s.MetaSubmittedAt); err == nil {
-				break
-			}
-		}
-		if err != nil {
-			return true
-		}
-	}
-	return time.Since(t) > resubmitTimeout
-}
-
-// ShouldWaitForCAR returns true if CAR was submitted recently and we should
-// keep waiting rather than resubmit.
-func (s *UploadState) ShouldWaitForCAR() bool {
-	if s.CarConfirmed {
-		return false
-	}
-	if s.CarTXID == "" || s.CarSubmittedAt == "" {
-		return false
-	}
-	if s.RetryCount >= maxRetries {
-		return false
-	}
-	t, err := time.Parse(time.RFC3339Nano, s.CarSubmittedAt)
-	if err != nil {
-		for _, layout := range []string{
-			time.RFC3339,
-			"2006-01-02T15:04:05Z07:00",
-			"2006-01-02T15:04:05-07:00",
-		} {
-			if t, err = time.Parse(layout, s.CarSubmittedAt); err == nil {
-				break
-			}
-		}
-		if err != nil {
-			return false
-		}
-	}
-	return time.Since(t) <= resubmitTimeout
+	return s.CarTXID == "" && s.Status != StatusDone
 }
 
 // =============================================================================
@@ -312,36 +213,11 @@ func ComputeFileHash(filePath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return computeFileHash(data), nil
+}
+
+// computeFileHash returns the hex-encoded SHA-256 of in-memory data.
+func computeFileHash(data []byte) string {
 	h := sha256.Sum256(data)
-	return fmt.Sprintf("%x", h[:]), nil
+	return fmt.Sprintf("%x", h[:])
 }
-
-// =============================================================================
-// Dedup gating
-// =============================================================================
-
-// ShouldAttemptDedup returns true when the uploader should query GraphQL
-// to check for an existing transaction on chain.
-//
-// Rules:
-//   - Always attempt dedup when status is pending, car_uploading, or
-//     car_confirmed (with empty MetaTXID) — the phases where we haven't
-//     yet confirmed a local transaction.
-//   - If CarTXID is already known (non-empty) AND MetaTXID is also known,
-//     skip dedup — we already have both transactions tracked.
-//   - If MetaTXID is empty, attempt dedup — we might find an existing
-//     upload from a previous run.
-func (s *UploadState) ShouldAttemptDedup() bool {
-	if s.Status == StatusPending || s.Status == StatusCarUploading {
-		return true
-	}
-	// After CAR confirmed, still attempt metadata dedup if MetaTXID is empty
-	if s.Status == StatusCarConfirmed && s.MetaTXID == "" {
-		return true
-	}
-	return s.CarTXID == ""
-}
-
-// GraphQL dedup query is implemented in arweave.GatewayClient.QueryExistingCAR.
-// The state package only manages local state files; network queries are done
-// by the uploader using the gateway client.
