@@ -245,17 +245,19 @@ func TestVerifyRemoteCAR_TruncatedDataSize(t *testing.T) {
 		t.Fatalf("failed to create CAR v2: %v", err)
 	}
 
-	// Build a mock that returns a truncated data_size (file appears too small).
+	// Build a mock that returns a truncated data_size AND serves only that
+	// many bytes of data (simulating an incomplete Arweave upload).
+	truncatedSize := len(carBytes) - 50
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// /tx/{txID} returns a data_size that is too small
 		if strings.HasPrefix(r.URL.Path, "/tx/") {
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"block_height":100,"data_size":"%d"}`, len(carBytes)-50)
+			fmt.Fprintf(w, `{"block_height":100,"data_size":"%d"}`, truncatedSize)
 			return
 		}
 
-		// Range requests serve real data (but reader won't reach the index)
+		// Range requests serve only up to data_size bytes
 		rangeHeader := r.Header.Get("Range")
 		if rangeHeader != "" {
 			var start, end int64
@@ -266,25 +268,25 @@ func TestVerifyRemoteCAR_TruncatedDataSize(t *testing.T) {
 					w.WriteHeader(http.StatusBadRequest)
 					return
 				}
-				end = int64(len(carBytes)) - 1
+				end = int64(truncatedSize) - 1
 			}
-			if start >= int64(len(carBytes)) {
+			if start >= int64(truncatedSize) {
 				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 				return
 			}
-			if end >= int64(len(carBytes)) {
-				end = int64(len(carBytes)) - 1
+			if end >= int64(truncatedSize) {
+				end = int64(truncatedSize) - 1
 			}
 			w.Header().Set("Content-Range",
-				fmt.Sprintf("bytes %d-%d/%d", start, end, len(carBytes)))
+				fmt.Sprintf("bytes %d-%d/%d", start, end, truncatedSize))
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
 			w.WriteHeader(http.StatusPartialContent)
 			w.Write(carBytes[start : end+1])
 			return
 		}
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(carBytes)))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", truncatedSize))
 		w.WriteHeader(http.StatusOK)
-		w.Write(carBytes)
+		w.Write(carBytes[:truncatedSize])
 	})
 
 	server := httptest.NewServer(mux)
